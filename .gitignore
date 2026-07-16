@@ -1,0 +1,26 @@
+# Conteúdo dos backups (a pasta permanece via .gitkeep)
+backups/*
+!backups/.gitkeep
+
+# Ansible
+*.retry
+.ansible/
+
+# Credenciais e configs de cloud / cluster
+.kube/
+kubeconfig*
+*.kubeconfig
+.aws/
+.azure/
+.gcloud/
+.oci/
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+service-account*.json
+credentials.json
+.env
+.env.*
+!.env.example

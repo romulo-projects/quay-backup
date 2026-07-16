@@ -1,0 +1,154 @@
+---
+- name: 1.Backup Red Hat Quay no OpenShift
+  hosts: localhost
+  gather_facts: true
+
+  vars:
+    backup_files:
+      quay_registry: quay-registry.yaml
+      managed_secret_keys: managed_secret_keys.yaml
+      config_bundle: config-bundle.yaml
+      quay_config: quay_config.yaml
+      quay_bundle_config: quay_bundle_config.yaml
+
+  tasks:
+    - name: 2.Validar que o oc está disponível
+      ansible.builtin.command: oc version --client
+      changed_when: false
+
+    - name: 3.Validar acesso ao cluster
+      ansible.builtin.command: oc whoami
+      changed_when: false
+
+    - name: 4.Criar diretório de backup
+      ansible.builtin.file:
+        path: "{{ backup_dir }}"
+        state: directory
+        mode: "0700"
+
+    - name: 5.Obter QuayRegistry custom resource
+      ansible.builtin.command:
+        cmd: >
+          oc get quayregistry {{ quay_instance }}
+          -n {{ quay_namespace }} -o yaml
+      register: quay_registry_backup
+      changed_when: false
+
+    - name: 6.Salvar backup do QuayRegistry
+      ansible.builtin.copy:
+        content: "{{ quay_registry_backup.stdout }}"
+        dest: "{{ backup_dir }}/{{ backup_files.quay_registry }}"
+        mode: "0600"
+
+    - name: 7.Obter secret de managed keys
+      ansible.builtin.command:
+        cmd: >
+          oc get secret {{ quay_instance }}-quay-registry-managed-secret-keys
+          -n {{ quay_namespace }} -o yaml
+      register: managed_keys_backup
+      changed_when: false
+
+    - name: 8.Salvar backup do managed keys secret
+      ansible.builtin.copy:
+        content: "{{ managed_keys_backup.stdout }}"
+        dest: "{{ backup_dir }}/{{ backup_files.managed_secret_keys }}"
+        mode: "0600"
+
+    - name: 9.Obter nome do config bundle secret
+      ansible.builtin.command:
+        cmd: >
+          oc get quayregistry {{ quay_instance }}
+          -n {{ quay_namespace }}
+          -o jsonpath='{.spec.configBundleSecret}'
+      register: config_bundle_secret_name
+      changed_when: false
+
+    - name: 10.Validar que o config bundle secret foi encontrado
+      ansible.builtin.assert:
+        that:
+          - config_bundle_secret_name.stdout | length > 0
+        fail_msg: "Não foi possível obter .spec.configBundleSecret do QuayRegistry."
+
+    - name: 11.Obter config bundle secret
+      ansible.builtin.command:
+        cmd: >
+          oc get secret {{ config_bundle_secret_name.stdout }}
+          -n {{ quay_namespace }} -o yaml
+      register: config_bundle_backup
+      changed_when: false
+
+    - name: 12.Salvar backup do config bundle secret
+      ansible.builtin.copy:
+        content: "{{ config_bundle_backup.stdout }}"
+        dest: "{{ backup_dir }}/{{ backup_files.config_bundle }}"
+        mode: "0600"
+
+    - name: 13.Obter bundle config.yaml values
+      ansible.builtin.command:
+        cmd: >
+          oc extract secret/{{ config_bundle_secret_name.stdout }} -n {{ quay_namespace }} --keys=config.yaml --to=-
+      register: config_bundle_values
+      changed_when: false
+
+    - name: 14.Salvar backup do config bundle secret
+      ansible.builtin.copy:
+        content: "{{ config_bundle_values.stdout }}"
+        dest: "{{ backup_dir }}/{{ backup_files.quay_bundle_config }}"
+        mode: "0600"
+
+    - name: 15.Obter pod da aplicação Quay
+      ansible.builtin.command:
+        cmd: >
+          oc get pods -l {{ quay_pod_label }}
+          -n {{ quay_namespace }}
+          -o jsonpath='{.items[0].metadata.name}'
+      register: quay_app_pod
+      changed_when: false
+
+    - name: 16.Validar que o pod Quay foi encontrado
+      ansible.builtin.assert:
+        that:
+          - quay_app_pod.stdout | length > 0
+        fail_msg: "Nenhum pod encontrado com label '{{ quay_pod_label }}' no namespace '{{ quay_namespace }}'."
+
+    - name: 17.Obter config.yaml do pod Quay
+      ansible.builtin.command:
+        cmd: >
+          oc exec {{ quay_app_pod.stdout }}
+          -n {{ quay_namespace }} -- cat /conf/stack/config.yaml
+      register: quay_config_backup
+      changed_when: false
+
+    - name: 18.Salvar backup do config.yaml
+      ansible.builtin.copy:
+        content: "{{ quay_config_backup.stdout }}"
+        dest: "{{ backup_dir }}/{{ backup_files.quay_config }}"
+        mode: "0600"
+
+    - name: 19.Adicionar variáveis readonly ao final do config.yaml
+      ansible.builtin.lineinfile:
+        path: "{{ backup_dir }}/{{ backup_files.quay_bundle_config }}"
+        regexp: '^{{ item.key }}:'
+        line: "{{ item.key }}: {{ item.value }}"
+        insertafter: EOF
+      loop: "{{ quay_readonly_config | dict2items }}"
+      tags:
+        - readonly_config
+        - readonly_add
+
+    - name: 20.Aplicar quay_bundle_config.yaml
+      ansible.builtin.command:
+        cmd: >
+          oc set data secret/{{ config_bundle_secret_name.stdout }}
+          -n {{ quay_namespace }}
+          --from-file=config.yaml={{ backup_dir }}/{{ backup_files.quay_bundle_config }}
+
+#    - name: 18.Remover variáveis readonly do config.yaml
+#      ansible.builtin.lineinfile:
+#        path: "{{ backup_dir }}/{{ backup_files.quay_config }}"
+#        regexp: '^{{ item.key }}:'
+#        state: absent
+#      loop: "{{ quay_readonly_config | dict2items }}"
+#      tags:
+#        - readonly_config
+#        - readonly_remove

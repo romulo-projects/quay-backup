@@ -1,0 +1,17 @@
+# Nome da instância Quay (QuayRegistry CR)
+quay_instance: quay-registry
+
+# Namespace onde o Quay está instalado
+quay_namespace: quay
+
+# Diretório onde os arquivos de backup serão salvos
+backup_dir: "{{ playbook_dir }}/backups/{{ ansible_date_time.iso8601_basic_short }}"
+
+# Label usada para localizar o pod da aplicação Quay
+quay_pod_label: app=quay
+
+# Variáveis de modo readonly do Quay
+quay_readonly_config:
+  REGISTRY_STATE: readonly
+  INSTANCE_SERVICE_KEY_KID_LOCATION: "'conf/stack/quay-readonly.kid'"
+  INSTANCE_SERVICE_KEY_LOCATION: "'conf/stack/quay-readonly.pem'"
