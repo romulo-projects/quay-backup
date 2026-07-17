@@ -2,6 +2,8 @@
 
 Ansible playbook to back up a Red Hat Quay instance running on OpenShift. It exports QuayRegistry and secrets, switches Quay to read-only, dumps the PostgreSQL database, optionally syncs object storage blobs from NooBaa/ODF S3, then restores normal operation.
 
+**Validated against:** Red Hat Quay **3.15.5**
+
 ## Prerequisites
 
 ### Binaries
