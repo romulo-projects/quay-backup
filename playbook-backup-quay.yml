@@ -194,8 +194,39 @@
       shell: >
         oc -n {{ quay_namespace }} exec {{ quay_database_pod_name.stdout }} -- /usr/bin/pg_dump -C {{ quay_database_name.stdout }}  > {{ backup_dir }}/{{ backup_files.quay_database_sql }}
       changed_when: false
-  
-    - name: 28.Remove readonly variables from config.yaml
+
+    - name: 28.Get noobaa s3 AWS_ACCESS_KEY_ID
+      ansible.builtin.shell: >
+        oc get secret -l app=noobaa -n {{ quay_namespace }}
+        -o jsonpath='{.items[0].data.AWS_ACCESS_KEY_ID}' | base64 -d
+      register: aws_access_key_id
+      changed_when: false
+      no_log: true
+      when: s3_bucket_odf | bool
+
+    - name: 29.Get noobaa s3 AWS_SECRET_ACCESS_KEY
+      ansible.builtin.shell: >
+        oc get secret -l app=noobaa -n {{ quay_namespace }}
+        -o jsonpath='{.items[0].data.AWS_SECRET_ACCESS_KEY}' | base64 -d
+      register: aws_secret_access_key
+      changed_when: false
+      no_log: true
+      when: s3_bucket_odf | bool
+
+    - name: 30.Copy s3 blobs
+      ansible.builtin.shell: >
+        aws s3 sync --no-verify-ssl
+        --endpoint https://$(oc get route s3 -n openshift-storage -o jsonpath='{.spec.host}')
+        s3://$(oc get cm -l app=noobaa -n {{ quay_namespace }} -o jsonpath='{.items[0].data.BUCKET_NAME}')
+        {{ backup_dir }}/s3_blobs
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ aws_access_key_id.stdout }}"
+        AWS_SECRET_ACCESS_KEY: "{{ aws_secret_access_key.stdout }}"
+      changed_when: false
+      no_log: true
+      when: s3_bucket_odf | bool
+
+    - name: 31.Remove readonly variables from config.yaml
       ansible.builtin.lineinfile:
         path: "{{ backup_dir }}/{{ backup_files.quay_bundle_config }}"
         regexp: '^{{ item.key }}:'
@@ -205,14 +236,14 @@
         - readonly_config
         - readonly_remove
 
-    - name: 29.Apply quay_bundle_config.yaml
+    - name: 32.Apply quay_bundle_config.yaml
       ansible.builtin.command:
         cmd: >
           oc set data secret/{{ config_bundle_secret_name.stdout }}
           -n {{ quay_namespace }}
           --from-file=config.yaml={{ backup_dir }}/{{ backup_files.quay_bundle_config }}
 
-    - name: 30.Wait for the Operator to start a new Quay rollout
+    - name: 33.Wait for the Operator to start a new Quay rollout
       shell: >
         oc rollout status deployment/{{ quay_instance }}-quay-app
         -n {{ quay_namespace }} --timeout=5s
@@ -223,12 +254,12 @@
       changed_when: false
       failed_when: false
 
-    - name: 31.Rollout not started
+    - name: 34.Rollout not started
       fail:
         msg: "O Operator não iniciou um novo rollout do deployment {{ quay_instance }}-quay-app, necessario verifificar manualmente."
       when: "'successfully rolled out' in rollout_normal_start.stdout"
 
-    - name: 32.Wait for Quay to start as **Normal**
+    - name: 35.Wait for Quay to start as **Normal**
       shell: >
         oc rollout status deployment/{{ quay_instance }}-quay-app
         -n {{ quay_namespace }} --timeout=5s
@@ -239,7 +270,7 @@
       changed_when: false
       failed_when: false
 
-    - name: 33.Rollout not finished
+    - name: 36.Rollout not finished
       fail:
         msg: "Rollout do deployment {{ quay_instance }}-quay-app, nao finalizado no tempo esperado, necessario verifificar manualmente."
       when: "'successfully rolled out' not in rollout_normal_status.stdout"

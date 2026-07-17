@@ -15,3 +15,5 @@ quay_readonly_config:
   REGISTRY_STATE: readonly
   INSTANCE_SERVICE_KEY_KID_LOCATION: "'conf/stack/quay-readonly.kid'"
   INSTANCE_SERVICE_KEY_LOCATION: "'conf/stack/quay-readonly.pem'"
+
+s3_bucket_odf: true
