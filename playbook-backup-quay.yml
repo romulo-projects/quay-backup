@@ -1,5 +1,5 @@
 ---
-- name: 1.Backup Red Hat Quay no OpenShift
+- name: 1.Backup Red Hat Quay on OpenShift
   hosts: localhost
   gather_facts: true
 
@@ -10,23 +10,24 @@
       config_bundle: config-bundle.yaml
       quay_config: quay_config.yaml
       quay_bundle_config: quay_bundle_config.yaml
+      quay_database_sql: backup.sql
 
   tasks:
-    - name: 2.Validar que o oc está disponível
+    - name: 2.Validate that oc is available
       ansible.builtin.command: oc version --client
       changed_when: false
 
-    - name: 3.Validar acesso ao cluster
+    - name: 3.Validate cluster access
       ansible.builtin.command: oc whoami
       changed_when: false
 
-    - name: 4.Criar diretório de backup
+    - name: 4.Create backup directory
       ansible.builtin.file:
         path: "{{ backup_dir }}"
         state: directory
         mode: "0700"
 
-    - name: 5.Obter QuayRegistry custom resource
+    - name: 5.Get QuayRegistry custom resource
       ansible.builtin.command:
         cmd: >
           oc get quayregistry {{ quay_instance }}
@@ -34,13 +35,13 @@
       register: quay_registry_backup
       changed_when: false
 
-    - name: 6.Salvar backup do QuayRegistry
+    - name: 6.Save QuayRegistry backup
       ansible.builtin.copy:
         content: "{{ quay_registry_backup.stdout }}"
         dest: "{{ backup_dir }}/{{ backup_files.quay_registry }}"
         mode: "0600"
 
-    - name: 7.Obter secret de managed keys
+    - name: 7.Get managed keys secret
       ansible.builtin.command:
         cmd: >
           oc get secret {{ quay_instance }}-quay-registry-managed-secret-keys
@@ -48,13 +49,13 @@
       register: managed_keys_backup
       changed_when: false
 
-    - name: 8.Salvar backup do managed keys secret
+    - name: 8.Save managed keys secret backup
       ansible.builtin.copy:
         content: "{{ managed_keys_backup.stdout }}"
         dest: "{{ backup_dir }}/{{ backup_files.managed_secret_keys }}"
         mode: "0600"
 
-    - name: 9.Obter nome do config bundle secret
+    - name: 9.Get config bundle secret name
       ansible.builtin.command:
         cmd: >
           oc get quayregistry {{ quay_instance }}
@@ -63,13 +64,13 @@
       register: config_bundle_secret_name
       changed_when: false
 
-    - name: 10.Validar que o config bundle secret foi encontrado
+    - name: 10.Validate that the config bundle secret was found
       ansible.builtin.assert:
         that:
           - config_bundle_secret_name.stdout | length > 0
         fail_msg: "Não foi possível obter .spec.configBundleSecret do QuayRegistry."
 
-    - name: 11.Obter config bundle secret
+    - name: 11.Get config bundle secret
       ansible.builtin.command:
         cmd: >
           oc get secret {{ config_bundle_secret_name.stdout }}
@@ -77,26 +78,26 @@
       register: config_bundle_backup
       changed_when: false
 
-    - name: 12.Salvar backup do config bundle secret
+    - name: 12.Save config bundle secret backup
       ansible.builtin.copy:
         content: "{{ config_bundle_backup.stdout }}"
         dest: "{{ backup_dir }}/{{ backup_files.config_bundle }}"
         mode: "0600"
 
-    - name: 13.Obter bundle config.yaml values
+    - name: 13.Get bundle config.yaml values
       ansible.builtin.command:
         cmd: >
           oc extract secret/{{ config_bundle_secret_name.stdout }} -n {{ quay_namespace }} --keys=config.yaml --to=-
       register: config_bundle_values
       changed_when: false
 
-    - name: 14.Salvar backup do config bundle secret
+    - name: 14.Save config bundle values backup
       ansible.builtin.copy:
         content: "{{ config_bundle_values.stdout }}"
         dest: "{{ backup_dir }}/{{ backup_files.quay_bundle_config }}"
         mode: "0600"
 
-    - name: 15.Obter pod da aplicação Quay
+    - name: 15.Get Quay application pod
       ansible.builtin.command:
         cmd: >
           oc get pods -l {{ quay_pod_label }}
@@ -105,13 +106,13 @@
       register: quay_app_pod
       changed_when: false
 
-    - name: 16.Validar que o pod Quay foi encontrado
+    - name: 16.Validate that the Quay pod was found
       ansible.builtin.assert:
         that:
           - quay_app_pod.stdout | length > 0
         fail_msg: "Nenhum pod encontrado com label '{{ quay_pod_label }}' no namespace '{{ quay_namespace }}'."
 
-    - name: 17.Obter config.yaml do pod Quay
+    - name: 17.Get config.yaml from Quay pod
       ansible.builtin.command:
         cmd: >
           oc exec {{ quay_app_pod.stdout }}
@@ -119,13 +120,13 @@
       register: quay_config_backup
       changed_when: false
 
-    - name: 18.Salvar backup do config.yaml
+    - name: 18.Save config.yaml backup
       ansible.builtin.copy:
         content: "{{ quay_config_backup.stdout }}"
         dest: "{{ backup_dir }}/{{ backup_files.quay_config }}"
         mode: "0600"
 
-    - name: 19.Adicionar variáveis readonly ao final do config.yaml
+    - name: 19.Add readonly variables to the end of config.yaml
       ansible.builtin.lineinfile:
         path: "{{ backup_dir }}/{{ backup_files.quay_bundle_config }}"
         regexp: '^{{ item.key }}:'
@@ -136,19 +137,109 @@
         - readonly_config
         - readonly_add
 
-    - name: 20.Aplicar quay_bundle_config.yaml
+    - name: 20.Apply quay_bundle_config.yaml
       ansible.builtin.command:
         cmd: >
           oc set data secret/{{ config_bundle_secret_name.stdout }}
           -n {{ quay_namespace }}
           --from-file=config.yaml={{ backup_dir }}/{{ backup_files.quay_bundle_config }}
 
-#    - name: 18.Remover variáveis readonly do config.yaml
-#      ansible.builtin.lineinfile:
-#        path: "{{ backup_dir }}/{{ backup_files.quay_config }}"
-#        regexp: '^{{ item.key }}:'
-#        state: absent
-#      loop: "{{ quay_readonly_config | dict2items }}"
-#      tags:
-#        - readonly_config
-#        - readonly_remove
+    - name: 21.Wait for the Operator to start a new Quay rollout
+      shell: >
+        oc rollout status deployment/{{ quay_instance }}-quay-app
+        -n {{ quay_namespace }} --timeout=5s
+      register: rollout_read_only_start
+      retries: 60
+      delay: 5
+      until: "'successfully rolled out' not in rollout_read_only_start.stdout"
+      changed_when: false
+      failed_when: false
+
+    - name: 22.Rollout not started
+      fail:
+        msg: "O Operator não iniciou um novo rollout do deployment {{ quay_instance }}-quay-app, necessario verifificar manualmente."
+      when: "'successfully rolled out' in rollout_read_only_start.stdout"
+
+    - name: 23.Wait for Quay to start as **ReadOnly**
+      shell: >
+        oc rollout status deployment/{{ quay_instance }}-quay-app
+        -n {{ quay_namespace }} --timeout=5s
+      register: rollout_read_only_status
+      retries: 80
+      delay: 5
+      until: "'successfully rolled out' in rollout_read_only_status.stdout"
+      changed_when: false
+      failed_when: false
+
+    - name: 24.Rollout not finished
+      fail:
+        msg: "Rollout do deployment {{ quay_instance }}-quay-app, nao finalizado no tempo esperado, necessario verifificar manualmente."
+      when: "'successfully rolled out' not in rollout_read_only_status.stdout"      
+
+    - name: 25.Get Quay database name
+      shell: >
+        oc -n {{ quay_namespace }} rsh \
+        $(oc get pod -l app=quay -o name -n {{ quay_namespace }} | head -n 1) \
+        cat /conf/stack/config.yaml | awk -F'/' '/^DB_URI/ {print $4}'
+      register: quay_database_name
+      changed_when: false
+
+    - name: 26.Get Quay database pod name
+      shell: >
+        oc get pod -l quay-component=postgres -n {{ quay_namespace }} -o jsonpath='{.items[0].metadata.name}'
+      register: quay_database_pod_name
+      changed_when: false
+
+    - name: 27.Dump Quay database
+      shell: >
+        oc -n {{ quay_namespace }} exec {{ quay_database_pod_name.stdout }} -- /usr/bin/pg_dump -C {{ quay_database_name.stdout }}  > {{ backup_dir }}/{{ backup_files.quay_database_sql }}
+      changed_when: false
+  
+    - name: 28.Remove readonly variables from config.yaml
+      ansible.builtin.lineinfile:
+        path: "{{ backup_dir }}/{{ backup_files.quay_bundle_config }}"
+        regexp: '^{{ item.key }}:'
+        state: absent
+      loop: "{{ quay_readonly_config | dict2items }}"
+      tags:
+        - readonly_config
+        - readonly_remove
+
+    - name: 29.Apply quay_bundle_config.yaml
+      ansible.builtin.command:
+        cmd: >
+          oc set data secret/{{ config_bundle_secret_name.stdout }}
+          -n {{ quay_namespace }}
+          --from-file=config.yaml={{ backup_dir }}/{{ backup_files.quay_bundle_config }}
+
+    - name: 30.Wait for the Operator to start a new Quay rollout
+      shell: >
+        oc rollout status deployment/{{ quay_instance }}-quay-app
+        -n {{ quay_namespace }} --timeout=5s
+      register: rollout_normal_start
+      retries: 60
+      delay: 5
+      until: "'successfully rolled out' not in rollout_normal_start.stdout"
+      changed_when: false
+      failed_when: false
+
+    - name: 31.Rollout not started
+      fail:
+        msg: "O Operator não iniciou um novo rollout do deployment {{ quay_instance }}-quay-app, necessario verifificar manualmente."
+      when: "'successfully rolled out' in rollout_normal_start.stdout"
+
+    - name: 32.Wait for Quay to start as **Normal**
+      shell: >
+        oc rollout status deployment/{{ quay_instance }}-quay-app
+        -n {{ quay_namespace }} --timeout=5s
+      register: rollout_normal_status
+      retries: 80
+      delay: 5
+      until: "'successfully rolled out' in rollout_normal_status.stdout"
+      changed_when: false
+      failed_when: false
+
+    - name: 33.Rollout not finished
+      fail:
+        msg: "Rollout do deployment {{ quay_instance }}-quay-app, nao finalizado no tempo esperado, necessario verifificar manualmente."
+      when: "'successfully rolled out' not in rollout_normal_status.stdout"
