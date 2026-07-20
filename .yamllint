@@ -1,10 +1,21 @@
 ---
 extends: default
 
+ignore: |
+  .venv/
+  backups/
+
 rules:
+  braces:
+    min-spaces-inside: 0
+    max-spaces-inside: 1
+  comments-indentation: false
   line-length:
     max: 160
     level: warning
+  octal-values:
+    forbid-implicit-octal: true
+    forbid-explicit-octal: true
   truthy:
     allowed-values: ["true", "false"]
   comments:

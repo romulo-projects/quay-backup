@@ -5,6 +5,7 @@ backups/*
 # Ansible
 *.retry
 .ansible/
+.venv/
 
 # Credenciais e configs de cloud / cluster
 .kube/
