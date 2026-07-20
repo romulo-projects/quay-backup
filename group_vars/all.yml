@@ -1,19 +1,36 @@
-# Nome da instância Quay (QuayRegistry CR)
+---
+# QuayRegistry custom resource and namespace.
 quay_instance: quay-registry
-
-# Namespace onde o Quay está instalado
 quay_namespace: quay
 
-# Diretório onde os arquivos de backup serão salvos
-backup_dir: "{{ playbook_dir }}/backups/{{ ansible_date_time.iso8601_basic_short }}"
+# Local backup destination. Each run creates <timestamp>.incomplete and only
+# promotes it to <timestamp> after validation and checksum generation.
+backup_root: "{{ playbook_dir }}/backups"
+backup_minimum_free_bytes: 10737418240  # 10 GiB; size this for your registry.
 
-# Label usada para localizar o pod da aplicação Quay
+# A ConfigMap with this name prevents concurrent backups of the same registry.
+backup_lock_name: "{{ quay_instance }}-backup-lock"
+
+# Pod and rollout settings.
 quay_pod_label: app=quay
+rollout_start_retries: 60
+rollout_poll_delay: 5
+rollout_timeout: 10m
 
-# Variáveis de modo readonly do Quay
+# Keys temporarily merged into a separate read-only copy of config.yaml.
 quay_readonly_config:
   REGISTRY_STATE: readonly
-  INSTANCE_SERVICE_KEY_KID_LOCATION: "'conf/stack/quay-readonly.kid'"
-  INSTANCE_SERVICE_KEY_LOCATION: "'conf/stack/quay-readonly.pem'"
+  INSTANCE_SERVICE_KEY_KID_LOCATION: conf/stack/quay-readonly.kid
+  INSTANCE_SERVICE_KEY_LOCATION: conf/stack/quay-readonly.pem
 
-s3_bucket_odf: true
+# Include managed NooBaa blobs in the disaster-recovery backup.
+backup_managed_noobaa_storage: true
+noobaa_route_namespace: openshift-storage
+
+# Keep TLS verification enabled. If the ingress CA is private, set this to the
+# local CA bundle path used by AWS CLI, for example /etc/pki/ca-trust/.../ca.crt.
+s3_tls_verify: true
+s3_ca_bundle: ""
+
+# Clair PostgreSQL is intentionally not included. Clair data can be rebuilt by
+# rescanning images; document the expected recovery time for your environment.

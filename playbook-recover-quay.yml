@@ -1,0 +1,161 @@
+---
+- name: Recover Quay from an interrupted backup
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    quay_deployment: "{{ quay_instance }}-quay-app"
+    original_config_file: "{{ recovery_backup_dir }}/config-original.yaml"
+
+  tasks:
+    - name: Require an explicit recovery directory
+      ansible.builtin.assert:
+        that:
+          - recovery_backup_dir is defined
+          - recovery_backup_dir | length > 0
+        fail_msg: >-
+          Pass -e recovery_backup_dir=/absolute/path/to/<timestamp>.incomplete.
+
+    - name: Check original config file
+      ansible.builtin.stat:
+        path: "{{ original_config_file }}"
+      register: original_config
+
+    - name: Validate recovery input
+      ansible.builtin.assert:
+        that:
+          - original_config.stat.exists
+          - original_config.stat.isreg
+          - original_config.stat.size | int > 0
+        fail_msg: "Missing or empty {{ original_config_file }}."
+
+    - name: Get config bundle secret name
+      ansible.builtin.command:
+        argv:
+          - oc
+          - get
+          - quayregistry
+          - "{{ quay_instance }}"
+          - --namespace
+          - "{{ quay_namespace }}"
+          - --output=jsonpath={.spec.configBundleSecret}
+      register: config_bundle_secret
+      changed_when: false
+
+    - name: Read current config bundle
+      ansible.builtin.command:
+        argv:
+          - oc
+          - extract
+          - "secret/{{ config_bundle_secret.stdout }}"
+          - --namespace
+          - "{{ quay_namespace }}"
+          - --keys=config.yaml
+          - --to=-
+      register: current_recovery_config
+      changed_when: false
+      no_log: true
+
+    - name: Determine whether a rollout is required
+      ansible.builtin.set_fact:
+        recovery_change_required: >-
+          {{ (current_recovery_config.stdout | from_yaml)
+             != (lookup('ansible.builtin.file', original_config_file) | from_yaml) }}
+      no_log: true
+
+    - name: Capture deployment generation before recovery
+      ansible.builtin.command:
+        argv:
+          - oc
+          - get
+          - deployment
+          - "{{ quay_deployment }}"
+          - --namespace
+          - "{{ quay_namespace }}"
+          - --output=jsonpath={.metadata.generation}
+      register: recovery_generation_before
+      changed_when: false
+      when: recovery_change_required | bool
+
+    - name: Apply exact original config
+      ansible.builtin.command:
+        argv:
+          - oc
+          - set
+          - data
+          - "secret/{{ config_bundle_secret.stdout }}"
+          - --namespace
+          - "{{ quay_namespace }}"
+          - "--from-file=config.yaml={{ original_config_file }}"
+      changed_when: true
+      no_log: true
+      when: recovery_change_required | bool
+
+    - name: Wait for a new recovery deployment generation
+      ansible.builtin.command:
+        argv:
+          - oc
+          - get
+          - deployment
+          - "{{ quay_deployment }}"
+          - --namespace
+          - "{{ quay_namespace }}"
+          - --output=jsonpath={.metadata.generation}
+      register: recovery_generation_after
+      until: recovery_generation_after.stdout | int > recovery_generation_before.stdout | int
+      retries: "{{ rollout_start_retries }}"
+      delay: "{{ rollout_poll_delay }}"
+      changed_when: false
+      when: recovery_change_required | bool
+
+    - name: Wait for recovered deployment
+      ansible.builtin.command:
+        argv:
+          - oc
+          - rollout
+          - status
+          - "deployment/{{ quay_deployment }}"
+          - --namespace
+          - "{{ quay_namespace }}"
+          - "--timeout={{ rollout_timeout }}"
+      changed_when: false
+      when: recovery_change_required | bool
+
+    - name: Read recovered live config
+      ansible.builtin.command:
+        argv:
+          - oc
+          - exec
+          - "deployment/{{ quay_deployment }}"
+          - --namespace
+          - "{{ quay_namespace }}"
+          - --
+          - cat
+          - /conf/stack/config.yaml
+      register: recovered_live_config
+      changed_when: false
+      no_log: true
+
+    - name: Verify Quay is no longer read-only
+      ansible.builtin.assert:
+        that:
+          - (recovered_live_config.stdout | from_yaml).REGISTRY_STATE | default('normal') != 'readonly'
+        fail_msg: The live Quay configuration is still read-only.
+
+    - name: Remove stale backup lock
+      ansible.builtin.command:
+        argv:
+          - oc
+          - delete
+          - configmap
+          - "{{ backup_lock_name }}"
+          - --namespace
+          - "{{ quay_namespace }}"
+          - --ignore-not-found=true
+      register: stale_lock_delete
+      changed_when: "'deleted' in stale_lock_delete.stdout"
+
+    - name: Report recovery completion
+      ansible.builtin.debug:
+        msg: Quay original configuration was restored and normal mode was verified.

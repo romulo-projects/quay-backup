@@ -1,0 +1,9 @@
+---
+profile: production
+exclude_paths:
+  - backups/
+mock_modules: []
+skip_list:
+  # Redirection is required to stream pg_dump/pg_restore without storing the
+  # database inside the pod.
+  - command-instead-of-shell

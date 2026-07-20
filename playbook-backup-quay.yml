@@ -1,276 +1,830 @@
 ---
-- name: 1.Backup Red Hat Quay on OpenShift
+- name: Back up Red Hat Quay on OpenShift
   hosts: localhost
+  connection: local
   gather_facts: true
 
   vars:
     backup_files:
       quay_registry: quay-registry.yaml
-      managed_secret_keys: managed_secret_keys.yaml
+      managed_secret_keys: managed-secret-keys.yaml
       config_bundle: config-bundle.yaml
-      quay_config: quay_config.yaml
-      quay_bundle_config: quay_bundle_config.yaml
-      quay_database_sql: backup.sql
+      quay_config: quay-config.yaml
+      config_original: config-original.yaml
+      config_readonly: config-readonly.yaml
+      quay_database: backup.dump
+      manifest: manifest.yml
+      checksums: SHA256SUMS
+    sensitive_metadata_fields:
+      - creationTimestamp
+      - finalizers
+      - generation
+      - managedFields
+      - ownerReferences
+      - resourceVersion
+      - uid
+    backup_id: "{{ ansible_date_time.iso8601_basic_short }}"
+    backup_incomplete_dir: "{{ backup_root }}/{{ backup_id }}.incomplete"
+    backup_final_dir: "{{ backup_root }}/{{ backup_id }}"
+    quay_deployment: "{{ quay_instance }}-quay-app"
 
-  tasks:
-    - name: 2.Validate that oc is available
-      ansible.builtin.command: oc version --client
+  pre_tasks:
+    - name: Validate required variable values
+      ansible.builtin.assert:
+        that:
+          - quay_instance | length > 0
+          - quay_namespace | length > 0
+          - backup_root | length > 0
+          - quay_pod_label | length > 0
+          - quay_readonly_config.REGISTRY_STATE == 'readonly'
+        fail_msg: Check the required values in group_vars/all.yml.
+      tags: [always, preflight]
+
+    - name: Check required local commands
+      ansible.builtin.command:
+        argv:
+          - sh
+          - -c
+          - "command -v {{ item }}"
+      loop: "{{ ['oc', 'sha256sum'] + (backup_managed_noobaa_storage | bool | ternary(['aws'], [])) }}"
       changed_when: false
+      tags: [always, preflight]
 
-    - name: 3.Validate cluster access
-      ansible.builtin.command: oc whoami
+    - name: Validate OpenShift authentication
+      ansible.builtin.command:
+        argv: [oc, whoami]
       changed_when: false
+      tags: [always, preflight]
 
-    - name: 4.Create backup directory
+    - name: Get the QuayRegistry object for preflight checks
+      ansible.builtin.command:
+        argv:
+          - oc
+          - get
+          - quayregistry
+          - "{{ quay_instance }}"
+          - --namespace
+          - "{{ quay_namespace }}"
+          - --output=json
+      register: quay_registry_raw
+      changed_when: false
+      tags: [always, preflight]
+
+    - name: Parse the QuayRegistry object
+      ansible.builtin.set_fact:
+        quay_registry_object: "{{ quay_registry_raw.stdout | from_json }}"
+      tags: [always, preflight]
+
+    - name: Validate Quay health and supported component topology
+      ansible.builtin.assert:
+        that:
+          - >-
+            quay_registry_object.status.conditions
+            | selectattr('type', 'equalto', 'Available')
+            | selectattr('status', 'equalto', 'True')
+            | list | length > 0
+          - >-
+            quay_registry_object.spec.components
+            | selectattr('kind', 'equalto', 'postgres')
+            | map(attribute='managed') | first | bool
+          - >-
+            quay_registry_object.spec.components
+            | selectattr('kind', 'equalto', 'objectstorage')
+            | map(attribute='managed') | first | bool
+        fail_msg: >-
+          Quay must be Available and this playbook requires Operator-managed
+          postgres and objectstorage components.
+      tags: [always, preflight]
+
+    - name: Get the config bundle secret name
+      ansible.builtin.set_fact:
+        config_bundle_secret_name: "{{ quay_registry_object.spec.configBundleSecret }}"
+      tags: [always, preflight]
+
+    - name: Check permissions required by the backup
+      ansible.builtin.command:
+        argv:
+          - oc
+          - auth
+          - can-i
+          - "{{ item.verb }}"
+          - "{{ item.resource }}"
+          - --namespace
+          - "{{ item.namespace }}"
+      loop:
+        - {verb: get, resource: quayregistries.quay.redhat.com, namespace: "{{ quay_namespace }}"}
+        - {verb: get, resource: secrets, namespace: "{{ quay_namespace }}"}
+        - {verb: update, resource: secrets, namespace: "{{ quay_namespace }}"}
+        - {verb: get, resource: pods, namespace: "{{ quay_namespace }}"}
+        - {verb: create, resource: pods/exec, namespace: "{{ quay_namespace }}"}
+        - {verb: create, resource: configmaps, namespace: "{{ quay_namespace }}"}
+        - {verb: delete, resource: configmaps, namespace: "{{ quay_namespace }}"}
+      register: permission_checks
+      changed_when: false
+      failed_when: permission_checks.stdout | trim != 'yes'
+      tags: [always, preflight]
+
+    - name: Create local backup root
       ansible.builtin.file:
-        path: "{{ backup_dir }}"
+        path: "{{ backup_root }}"
         state: directory
         mode: "0700"
+      tags: [always, preflight]
 
-    - name: 5.Get QuayRegistry custom resource
+    - name: Check NooBaa route permission
       ansible.builtin.command:
-        cmd: >
-          oc get quayregistry {{ quay_instance }}
-          -n {{ quay_namespace }} -o yaml
-      register: quay_registry_backup
+        argv:
+          - oc
+          - auth
+          - can-i
+          - get
+          - routes.route.openshift.io
+          - --namespace
+          - "{{ noobaa_route_namespace }}"
+      register: noobaa_route_permission
       changed_when: false
+      failed_when: noobaa_route_permission.stdout | trim != 'yes'
+      when: backup_managed_noobaa_storage | bool
+      tags: [always, preflight]
 
-    - name: 6.Save QuayRegistry backup
-      ansible.builtin.copy:
-        content: "{{ quay_registry_backup.stdout }}"
-        dest: "{{ backup_dir }}/{{ backup_files.quay_registry }}"
-        mode: "0600"
-
-    - name: 7.Get managed keys secret
+    - name: Validate managed NooBaa resources before changing Quay
       ansible.builtin.command:
-        cmd: >
-          oc get secret {{ quay_instance }}-quay-registry-managed-secret-keys
-          -n {{ quay_namespace }} -o yaml
-      register: managed_keys_backup
+        argv: "{{ item }}"
+      loop:
+        - [oc, get, secret, --selector=app=noobaa, --namespace, "{{ quay_namespace }}", --output=name]
+        - [oc, get, configmap, --selector=app=noobaa, --namespace, "{{ quay_namespace }}", --output=name]
+        - [oc, get, route, s3, --namespace, "{{ noobaa_route_namespace }}", --output=name]
+      register: noobaa_preflight_resources
       changed_when: false
+      failed_when: noobaa_preflight_resources.stdout | trim | length == 0
+      no_log: true
+      when: backup_managed_noobaa_storage | bool
+      tags: [always, preflight]
 
-    - name: 8.Save managed keys secret backup
-      ansible.builtin.copy:
-        content: "{{ managed_keys_backup.stdout }}"
-        dest: "{{ backup_dir }}/{{ backup_files.managed_secret_keys }}"
-        mode: "0600"
-
-    - name: 9.Get config bundle secret name
+    - name: Check free space in the backup filesystem
       ansible.builtin.command:
-        cmd: >
-          oc get quayregistry {{ quay_instance }}
-          -n {{ quay_namespace }}
-          -o jsonpath='{.spec.configBundleSecret}'
-      register: config_bundle_secret_name
+        argv:
+          - df
+          - --output=avail
+          - --block-size=1
+          - "{{ backup_root }}"
+      register: backup_disk_free
       changed_when: false
+      tags: [always, preflight]
 
-    - name: 10.Validate that the config bundle secret was found
+    - name: Validate minimum local free space
       ansible.builtin.assert:
         that:
-          - config_bundle_secret_name.stdout | length > 0
-        fail_msg: "Não foi possível obter .spec.configBundleSecret do QuayRegistry."
+          - (backup_disk_free.stdout_lines | last | trim | int) >= backup_minimum_free_bytes | int
+        fail_msg: >-
+          The backup filesystem has less than {{ backup_minimum_free_bytes }}
+          bytes available.
+      tags: [always, preflight]
 
-    - name: 11.Get config bundle secret
-      ansible.builtin.command:
-        cmd: >
-          oc get secret {{ config_bundle_secret_name.stdout }}
-          -n {{ quay_namespace }} -o yaml
-      register: config_bundle_backup
-      changed_when: false
+    - name: Check backup destination paths
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ backup_incomplete_dir }}"
+        - "{{ backup_final_dir }}"
+      register: backup_destination_paths
+      tags: [always, preflight]
 
-    - name: 12.Save config bundle secret backup
-      ansible.builtin.copy:
-        content: "{{ config_bundle_backup.stdout }}"
-        dest: "{{ backup_dir }}/{{ backup_files.config_bundle }}"
-        mode: "0600"
-
-    - name: 13.Get bundle config.yaml values
-      ansible.builtin.command:
-        cmd: >
-          oc extract secret/{{ config_bundle_secret_name.stdout }} -n {{ quay_namespace }} --keys=config.yaml --to=-
-      register: config_bundle_values
-      changed_when: false
-
-    - name: 14.Save config bundle values backup
-      ansible.builtin.copy:
-        content: "{{ config_bundle_values.stdout }}"
-        dest: "{{ backup_dir }}/{{ backup_files.quay_bundle_config }}"
-        mode: "0600"
-
-    - name: 15.Get Quay application pod
-      ansible.builtin.command:
-        cmd: >
-          oc get pods -l {{ quay_pod_label }}
-          -n {{ quay_namespace }}
-          -o jsonpath='{.items[0].metadata.name}'
-      register: quay_app_pod
-      changed_when: false
-
-    - name: 16.Validate that the Quay pod was found
+    - name: Refuse to overwrite an existing backup path
       ansible.builtin.assert:
         that:
-          - quay_app_pod.stdout | length > 0
-        fail_msg: "Nenhum pod encontrado com label '{{ quay_pod_label }}' no namespace '{{ quay_namespace }}'."
+          - not (backup_destination_paths.results | map(attribute='stat.exists') | select('equalto', true) | list)
+        fail_msg: A backup path for this timestamp already exists; nothing was overwritten.
+      tags: [always, preflight]
 
-    - name: 17.Get config.yaml from Quay pod
+    - name: Create incomplete backup directory
+      ansible.builtin.file:
+        path: "{{ backup_incomplete_dir }}"
+        state: directory
+        mode: "0700"
+      tags: [always, preflight]
+
+    - name: Acquire the cluster-wide backup lock
       ansible.builtin.command:
-        cmd: >
-          oc exec {{ quay_app_pod.stdout }}
-          -n {{ quay_namespace }} -- cat /conf/stack/config.yaml
-      register: quay_config_backup
-      changed_when: false
+        argv:
+          - oc
+          - create
+          - configmap
+          - "{{ backup_lock_name }}"
+          - --namespace
+          - "{{ quay_namespace }}"
+          - "--from-literal=backup_id={{ backup_id }}"
+          - "--from-literal=controller={{ ansible_hostname }}"
+      register: backup_lock_create
+      changed_when: true
+      tags: [always, preflight]
 
-    - name: 18.Save config.yaml backup
+  tasks:
+    - name: Execute protected backup workflow
+      block:
+        - name: Export managed secret keys
+          ansible.builtin.command:
+            argv:
+              - oc
+              - get
+              - secret
+              - "{{ quay_instance }}-quay-registry-managed-secret-keys"
+              - --namespace
+              - "{{ quay_namespace }}"
+              - --output=json
+          register: managed_keys_raw
+          changed_when: false
+          no_log: true
+
+        - name: Export config bundle secret
+          ansible.builtin.command:
+            argv:
+              - oc
+              - get
+              - secret
+              - "{{ config_bundle_secret_name }}"
+              - --namespace
+              - "{{ quay_namespace }}"
+              - --output=json
+          register: config_bundle_raw
+          changed_when: false
+          no_log: true
+
+        - name: Build portable recovery objects
+          ansible.builtin.set_fact:
+            clean_quay_registry_metadata: >-
+              {{ quay_registry_object.metadata | dict2items
+                 | rejectattr('key', 'in', sensitive_metadata_fields)
+                 | items2dict }}
+            clean_managed_keys_metadata: >-
+              {{ (managed_keys_raw.stdout | from_json).metadata | dict2items
+                 | rejectattr('key', 'in', sensitive_metadata_fields)
+                 | items2dict }}
+            clean_config_bundle_metadata: >-
+              {{ (config_bundle_raw.stdout | from_json).metadata | dict2items
+                 | rejectattr('key', 'in', sensitive_metadata_fields)
+                 | items2dict }}
+          no_log: true
+
+        - name: Save portable QuayRegistry backup
+          ansible.builtin.copy:
+            content: >-
+              {{ (quay_registry_object | dict2items
+                  | rejectattr('key', 'equalto', 'status') | items2dict)
+                 | combine({'metadata': clean_quay_registry_metadata})
+                 | to_nice_yaml(indent=2, sort_keys=false) }}
+            dest: "{{ backup_incomplete_dir }}/{{ backup_files.quay_registry }}"
+            mode: "0600"
+
+        - name: Save portable managed keys backup
+          ansible.builtin.copy:
+            content: >-
+              {{ (managed_keys_raw.stdout | from_json)
+                 | combine({'metadata': clean_managed_keys_metadata})
+                 | to_nice_yaml(indent=2, sort_keys=false) }}
+            dest: "{{ backup_incomplete_dir }}/{{ backup_files.managed_secret_keys }}"
+            mode: "0600"
+          no_log: true
+
+        - name: Save portable config bundle backup
+          ansible.builtin.copy:
+            content: >-
+              {{ (config_bundle_raw.stdout | from_json)
+                 | combine({'metadata': clean_config_bundle_metadata})
+                 | to_nice_yaml(indent=2, sort_keys=false) }}
+            dest: "{{ backup_incomplete_dir }}/{{ backup_files.config_bundle }}"
+            mode: "0600"
+          no_log: true
+
+        - name: Extract the original config bundle
+          ansible.builtin.command:
+            argv:
+              - oc
+              - extract
+              - "secret/{{ config_bundle_secret_name }}"
+              - --namespace
+              - "{{ quay_namespace }}"
+              - --keys=config.yaml
+              - --to=-
+          register: original_config_raw
+          changed_when: false
+          no_log: true
+
+        - name: Save immutable original config
+          ansible.builtin.copy:
+            content: "{{ original_config_raw.stdout }}\n"
+            dest: "{{ backup_incomplete_dir }}/{{ backup_files.config_original }}"
+            mode: "0600"
+          no_log: true
+
+        - name: Parse and validate original Quay config
+          ansible.builtin.set_fact:
+            original_quay_config: "{{ original_config_raw.stdout | from_yaml }}"
+          no_log: true
+
+        - name: Refuse to start when Quay is already read-only
+          ansible.builtin.assert:
+            that:
+              - original_quay_config.REGISTRY_STATE | default('normal') != 'readonly'
+            fail_msg: >-
+              Quay is already read-only. Recover normal mode before starting a
+              new backup.
+
+        - name: Validate read-only service key files in config bundle
+          ansible.builtin.assert:
+            that:
+              - "'quay-readonly.kid' in (config_bundle_raw.stdout | from_json).data"
+              - "'quay-readonly.pem' in (config_bundle_raw.stdout | from_json).data"
+            fail_msg: >-
+              The config bundle does not contain quay-readonly.kid and
+              quay-readonly.pem.
+          no_log: true
+
+        - name: Build read-only Quay config structurally
+          ansible.builtin.copy:
+            content: >-
+              {{ original_quay_config
+                 | combine(quay_readonly_config, recursive=false)
+                 | to_nice_yaml(indent=2, sort_keys=false) }}
+            dest: "{{ backup_incomplete_dir }}/{{ backup_files.config_readonly }}"
+            mode: "0600"
+          no_log: true
+
+        - name: Get ready Quay application pods
+          ansible.builtin.command:
+            argv:
+              - oc
+              - get
+              - pods
+              - --selector
+              - "{{ quay_pod_label }}"
+              - --namespace
+              - "{{ quay_namespace }}"
+              - --output=jsonpath={.items[?(@.status.containerStatuses[0].ready==true)].metadata.name}
+          register: quay_pods_raw
+          changed_when: false
+
+        - name: Validate and select a ready Quay pod
+          ansible.builtin.assert:
+            that:
+              - quay_pods_raw.stdout.split() | length > 0
+            fail_msg: No ready Quay application pod was found.
+
+        - name: Select a ready Quay pod
+          ansible.builtin.set_fact:
+            quay_app_pod: "{{ quay_pods_raw.stdout.split() | first }}"
+
+        - name: Export live Quay config
+          ansible.builtin.command:
+            argv:
+              - oc
+              - exec
+              - "{{ quay_app_pod }}"
+              - --namespace
+              - "{{ quay_namespace }}"
+              - --
+              - cat
+              - /conf/stack/config.yaml
+          register: live_quay_config
+          changed_when: false
+          no_log: true
+
+        - name: Save live Quay config
+          ansible.builtin.copy:
+            content: "{{ live_quay_config.stdout }}\n"
+            dest: "{{ backup_incomplete_dir }}/{{ backup_files.quay_config }}"
+            mode: "0600"
+          no_log: true
+
+        - name: Read database URI from effective live config
+          ansible.builtin.set_fact:
+            database_uri: "{{ (live_quay_config.stdout | from_yaml).DB_URI }}"
+          no_log: true
+
+        - name: Validate effective database URI
+          ansible.builtin.assert:
+            that:
+              - database_uri | length > 0
+            fail_msg: DB_URI is missing from the effective live Quay config.
+
+        - name: Capture deployment generation before read-only change
+          ansible.builtin.command:
+            argv:
+              - oc
+              - get
+              - deployment
+              - "{{ quay_deployment }}"
+              - --namespace
+              - "{{ quay_namespace }}"
+              - --output=jsonpath={.metadata.generation}
+          register: generation_before_readonly
+          changed_when: false
+
+        - name: Apply read-only Quay config
+          ansible.builtin.command:
+            argv:
+              - oc
+              - set
+              - data
+              - "secret/{{ config_bundle_secret_name }}"
+              - --namespace
+              - "{{ quay_namespace }}"
+              - "--from-file=config.yaml={{ backup_incomplete_dir }}/{{ backup_files.config_readonly }}"
+          changed_when: true
+          no_log: true
+
+        - name: Record that config restoration is required
+          ansible.builtin.set_fact:
+            restore_original_config_required: true
+
+        - name: Wait for a new read-only deployment generation
+          ansible.builtin.command:
+            argv:
+              - oc
+              - get
+              - deployment
+              - "{{ quay_deployment }}"
+              - --namespace
+              - "{{ quay_namespace }}"
+              - --output=jsonpath={.metadata.generation}
+          register: generation_after_readonly
+          until: generation_after_readonly.stdout | int > generation_before_readonly.stdout | int
+          retries: "{{ rollout_start_retries }}"
+          delay: "{{ rollout_poll_delay }}"
+          changed_when: false
+
+        - name: Wait for read-only deployment rollout
+          ansible.builtin.command:
+            argv:
+              - oc
+              - rollout
+              - status
+              - "deployment/{{ quay_deployment }}"
+              - --namespace
+              - "{{ quay_namespace }}"
+              - "--timeout={{ rollout_timeout }}"
+          changed_when: false
+
+        - name: Get live config after read-only rollout
+          ansible.builtin.command:
+            argv:
+              - oc
+              - exec
+              - "deployment/{{ quay_deployment }}"
+              - --namespace
+              - "{{ quay_namespace }}"
+              - --
+              - cat
+              - /conf/stack/config.yaml
+          register: readonly_live_config
+          changed_when: false
+          no_log: true
+
+        - name: Verify Quay is actually read-only
+          ansible.builtin.assert:
+            that:
+              - (readonly_live_config.stdout | from_yaml).REGISTRY_STATE == 'readonly'
+            fail_msg: The rollout completed but the live Quay config is not read-only.
+
+        - name: Derive database name safely from DB_URI
+          ansible.builtin.set_fact:
+            quay_database_name: >-
+              {{ database_uri
+                 | regex_replace('^.*/', '')
+                 | regex_replace('\?.*$', '') }}
+          no_log: true
+
+        - name: Validate database name
+          ansible.builtin.assert:
+            that:
+              - quay_database_name | length > 0
+              - quay_database_name is match('^[A-Za-z0-9_.-]+$')
+            fail_msg: Could not derive a safe PostgreSQL database name from DB_URI.
+
+        - name: Get running PostgreSQL pods
+          ansible.builtin.command:
+            argv:
+              - oc
+              - get
+              - pods
+              - --selector=quay-component=postgres
+              - --field-selector=status.phase=Running
+              - --namespace
+              - "{{ quay_namespace }}"
+              - --output=json
+          register: postgres_pods_raw
+          changed_when: false
+
+        - name: Select a PostgreSQL pod
+          ansible.builtin.assert:
+            that:
+              - (postgres_pods_raw.stdout | from_json).items | length > 0
+            fail_msg: No running Operator-managed PostgreSQL pod was found.
+
+        - name: Set PostgreSQL pod name
+          ansible.builtin.set_fact:
+            quay_database_pod: "{{ (postgres_pods_raw.stdout | from_json).items | map(attribute='metadata.name') | first }}"
+
+        - name: Create PostgreSQL custom-format dump
+          ansible.builtin.shell: >-
+            set -o pipefail &&
+            oc exec {{ quay_database_pod | quote }}
+            --namespace {{ quay_namespace | quote }} --
+            /usr/bin/pg_dump --format=custom --create {{ quay_database_name | quote }}
+            > {{ (backup_incomplete_dir ~ '/' ~ backup_files.quay_database) | quote }}
+          args:
+            executable: /bin/bash
+          changed_when: true
+
+        - name: Check database dump size
+          ansible.builtin.stat:
+            path: "{{ backup_incomplete_dir }}/{{ backup_files.quay_database }}"
+          register: database_dump_stat
+
+        - name: Reject an empty database dump
+          ansible.builtin.assert:
+            that:
+              - database_dump_stat.stat.exists
+              - database_dump_stat.stat.size | int > 0
+            fail_msg: PostgreSQL dump is missing or empty.
+
+        - name: Validate PostgreSQL dump catalog
+          ansible.builtin.shell: >-
+            set -o pipefail &&
+            oc exec --stdin {{ quay_database_pod | quote }}
+            --namespace {{ quay_namespace | quote }} --
+            /usr/bin/pg_restore --list
+            < {{ (backup_incomplete_dir ~ '/' ~ backup_files.quay_database) | quote }}
+          args:
+            executable: /bin/bash
+          changed_when: false
+
+        - name: Read NooBaa credentials
+          ansible.builtin.command:
+            argv:
+              - oc
+              - get
+              - secret
+              - --selector=app=noobaa
+              - --namespace
+              - "{{ quay_namespace }}"
+              - --output=json
+          register: noobaa_secret_raw
+          changed_when: false
+          no_log: true
+          when: backup_managed_noobaa_storage | bool
+
+        - name: Read NooBaa bucket configuration
+          ansible.builtin.command:
+            argv:
+              - oc
+              - get
+              - configmap
+              - --selector=app=noobaa
+              - --namespace
+              - "{{ quay_namespace }}"
+              - --output=json
+          register: noobaa_config_raw
+          changed_when: false
+          when: backup_managed_noobaa_storage | bool
+
+        - name: Read NooBaa S3 route
+          ansible.builtin.command:
+            argv:
+              - oc
+              - get
+              - route
+              - s3
+              - --namespace
+              - "{{ noobaa_route_namespace }}"
+              - --output=jsonpath={.spec.host}
+          register: noobaa_route_host
+          changed_when: false
+          when: backup_managed_noobaa_storage | bool
+
+        - name: Parse NooBaa backup settings
+          ansible.builtin.set_fact:
+            noobaa_access_key: >-
+              {{ (noobaa_secret_raw.stdout | from_json).items[0].data.AWS_ACCESS_KEY_ID | b64decode }}
+            noobaa_secret_key: >-
+              {{ (noobaa_secret_raw.stdout | from_json).items[0].data.AWS_SECRET_ACCESS_KEY | b64decode }}
+            noobaa_bucket_name: >-
+              {{ (noobaa_config_raw.stdout | from_json).items[0].data.BUCKET_NAME }}
+          no_log: true
+          when: backup_managed_noobaa_storage | bool
+
+        - name: Back up managed NooBaa object storage
+          ansible.builtin.command:
+            argv: >-
+              {{ ['aws', 's3', 'sync']
+                 + (s3_tls_verify | bool | ternary([], ['--no-verify-ssl']))
+                 + ['--endpoint-url', 'https://' ~ noobaa_route_host.stdout,
+                    's3://' ~ noobaa_bucket_name,
+                    backup_incomplete_dir ~ '/s3-blobs'] }}
+          environment:
+            AWS_ACCESS_KEY_ID: "{{ noobaa_access_key }}"
+            AWS_SECRET_ACCESS_KEY: "{{ noobaa_secret_key }}"
+            AWS_CA_BUNDLE: "{{ s3_ca_bundle | default(omit, true) }}"
+          changed_when: true
+          no_log: true
+          when: backup_managed_noobaa_storage | bool
+
+        - name: Mark protected data collection successful
+          ansible.builtin.set_fact:
+            backup_data_collected: true
+
+      rescue:
+        - name: Record protected workflow failure
+          ansible.builtin.set_fact:
+            backup_failure_message: >-
+              {{ ansible_failed_result.msg | default('Unknown backup failure') }}
+
+      always:
+        - name: Capture deployment generation before config restoration
+          ansible.builtin.command:
+            argv:
+              - oc
+              - get
+              - deployment
+              - "{{ quay_deployment }}"
+              - --namespace
+              - "{{ quay_namespace }}"
+              - --output=jsonpath={.metadata.generation}
+          register: restore_generation_before
+          changed_when: false
+          failed_when: false
+          when: restore_original_config_required | default(false) | bool
+
+        - name: Restore exact original config bundle
+          ansible.builtin.command:
+            argv:
+              - oc
+              - set
+              - data
+              - "secret/{{ config_bundle_secret_name }}"
+              - --namespace
+              - "{{ quay_namespace }}"
+              - "--from-file=config.yaml={{ backup_incomplete_dir }}/{{ backup_files.config_original }}"
+          register: restore_original_config
+          changed_when: restore_original_config.rc == 0
+          failed_when: false
+          no_log: true
+          when: restore_original_config_required | default(false) | bool
+
+        - name: Wait for a new normal deployment generation
+          ansible.builtin.command:
+            argv:
+              - oc
+              - get
+              - deployment
+              - "{{ quay_deployment }}"
+              - --namespace
+              - "{{ quay_namespace }}"
+              - --output=jsonpath={.metadata.generation}
+          register: restore_generation_after
+          until: >-
+            restore_generation_after.stdout | int
+            > restore_generation_before.stdout | int
+          retries: "{{ rollout_start_retries }}"
+          delay: "{{ rollout_poll_delay }}"
+          changed_when: false
+          failed_when: false
+          when:
+            - restore_original_config_required | default(false) | bool
+            - restore_generation_before.rc | default(1) == 0
+            - restore_original_config.rc | default(1) == 0
+
+        - name: Wait for normal deployment rollout
+          ansible.builtin.command:
+            argv:
+              - oc
+              - rollout
+              - status
+              - "deployment/{{ quay_deployment }}"
+              - --namespace
+              - "{{ quay_namespace }}"
+              - "--timeout={{ rollout_timeout }}"
+          register: normal_rollout
+          changed_when: false
+          failed_when: false
+          when:
+            - restore_original_config_required | default(false) | bool
+            - restore_original_config.rc | default(1) == 0
+            - restore_generation_after.rc | default(1) == 0
+
+        - name: Verify normal mode from live config
+          ansible.builtin.command:
+            argv:
+              - oc
+              - exec
+              - "deployment/{{ quay_deployment }}"
+              - --namespace
+              - "{{ quay_namespace }}"
+              - --
+              - cat
+              - /conf/stack/config.yaml
+          register: normal_live_config
+          changed_when: false
+          failed_when: false
+          no_log: true
+          when:
+            - restore_original_config_required | default(false) | bool
+            - restore_original_config.rc | default(1) == 0
+            - normal_rollout.rc | default(1) == 0
+
+        - name: Record config restoration result
+          ansible.builtin.set_fact:
+            config_restored_successfully: >-
+              {{ not (restore_original_config_required | default(false) | bool)
+                 or (restore_original_config.rc | default(1) == 0
+                     and restore_generation_after.rc | default(1) == 0
+                     and normal_rollout.rc | default(1) == 0
+                     and normal_live_config.rc | default(1) == 0
+                     and (normal_live_config.stdout | from_yaml).REGISTRY_STATE
+                         | default('normal') != 'readonly') }}
+
+        - name: Release the cluster-wide backup lock
+          ansible.builtin.command:
+            argv:
+              - oc
+              - delete
+              - configmap
+              - "{{ backup_lock_name }}"
+              - --namespace
+              - "{{ quay_namespace }}"
+              - --ignore-not-found=true
+          register: backup_lock_delete
+          changed_when: "'deleted' in backup_lock_delete.stdout"
+          failed_when: false
+
+    - name: Stop when normal Quay config could not be restored
+      ansible.builtin.fail:
+        msg: >-
+          CRITICAL: the original Quay config could not be confirmed after the
+          backup attempt. Run playbook-recover-quay.yml immediately with
+          recovery_backup_dir={{ backup_incomplete_dir }}.
+      when: not config_restored_successfully | bool
+
+    - name: Stop after protected workflow failure
+      ansible.builtin.fail:
+        msg: "Backup failed and remains incomplete: {{ backup_failure_message }}"
+      when: backup_failure_message is defined
+
+    - name: Find all completed backup payload files
+      ansible.builtin.find:
+        paths: "{{ backup_incomplete_dir }}"
+        recurse: true
+        file_type: file
+        excludes:
+          - "{{ backup_files.manifest }}"
+          - "{{ backup_files.checksums }}"
+      register: backup_payload_files
+
+    - name: Calculate payload checksums
+      ansible.builtin.stat:
+        path: "{{ item.path }}"
+        checksum_algorithm: sha256
+        get_checksum: true
+      loop: "{{ backup_payload_files.files }}"
+      loop_control:
+        label: "{{ item.path | basename }}"
+      register: payload_checksums
+
+    - name: Write checksum inventory
       ansible.builtin.copy:
-        content: "{{ quay_config_backup.stdout }}"
-        dest: "{{ backup_dir }}/{{ backup_files.quay_config }}"
+        content: |-
+          {% for result in payload_checksums.results | sort(attribute='item.path') %}
+          {{ result.stat.checksum }}  {{ result.item.path | regex_replace('^' ~ backup_incomplete_dir ~ '/', '') }}
+          {% endfor %}
+        dest: "{{ backup_incomplete_dir }}/{{ backup_files.checksums }}"
         mode: "0600"
 
-    - name: 19.Add readonly variables to the end of config.yaml
-      ansible.builtin.lineinfile:
-        path: "{{ backup_dir }}/{{ backup_files.quay_bundle_config }}"
-        regexp: '^{{ item.key }}:'
-        line: "{{ item.key }}: {{ item.value }}"
-        insertafter: EOF
-      loop: "{{ quay_readonly_config | dict2items }}"
-      tags:
-        - readonly_config
-        - readonly_add
+    - name: Write successful backup manifest
+      ansible.builtin.copy:
+        content: >-
+          {{ {'status': 'complete',
+              'backup_id': backup_id,
+              'started_at': ansible_date_time.iso8601,
+              'finished_at': now(utc=true, fmt='%Y-%m-%dT%H:%M:%SZ'),
+              'quay_instance': quay_instance,
+              'quay_namespace': quay_namespace,
+              'database_format': 'postgresql-custom',
+              'database_catalog_validated': true,
+              'object_storage_included': backup_managed_noobaa_storage | bool,
+              'checksums_file': backup_files.checksums,
+              'clair_database_included': false}
+             | to_nice_yaml(indent=2, sort_keys=false) }}
+        dest: "{{ backup_incomplete_dir }}/{{ backup_files.manifest }}"
+        mode: "0600"
 
-    - name: 20.Apply quay_bundle_config.yaml
+    - name: Promote validated backup atomically
       ansible.builtin.command:
-        cmd: >
-          oc set data secret/{{ config_bundle_secret_name.stdout }}
-          -n {{ quay_namespace }}
-          --from-file=config.yaml={{ backup_dir }}/{{ backup_files.quay_bundle_config }}
+        argv:
+          - mv
+          - "{{ backup_incomplete_dir }}"
+          - "{{ backup_final_dir }}"
+      changed_when: true
 
-    - name: 21.Wait for the Operator to start a new Quay rollout
-      shell: >
-        oc rollout status deployment/{{ quay_instance }}-quay-app
-        -n {{ quay_namespace }} --timeout=5s
-      register: rollout_read_only_start
-      retries: 60
-      delay: 5
-      until: "'successfully rolled out' not in rollout_read_only_start.stdout"
-      changed_when: false
-      failed_when: false
-
-    - name: 22.Rollout not started
-      fail:
-        msg: "O Operator não iniciou um novo rollout do deployment {{ quay_instance }}-quay-app, necessario verifificar manualmente."
-      when: "'successfully rolled out' in rollout_read_only_start.stdout"
-
-    - name: 23.Wait for Quay to start as **ReadOnly**
-      shell: >
-        oc rollout status deployment/{{ quay_instance }}-quay-app
-        -n {{ quay_namespace }} --timeout=5s
-      register: rollout_read_only_status
-      retries: 80
-      delay: 5
-      until: "'successfully rolled out' in rollout_read_only_status.stdout"
-      changed_when: false
-      failed_when: false
-
-    - name: 24.Rollout not finished
-      fail:
-        msg: "Rollout do deployment {{ quay_instance }}-quay-app, nao finalizado no tempo esperado, necessario verifificar manualmente."
-      when: "'successfully rolled out' not in rollout_read_only_status.stdout"      
-
-    - name: 25.Get Quay database name
-      shell: >
-        oc -n {{ quay_namespace }} rsh \
-        $(oc get pod -l app=quay -o name -n {{ quay_namespace }} | head -n 1) \
-        cat /conf/stack/config.yaml | awk -F'/' '/^DB_URI/ {print $4}'
-      register: quay_database_name
-      changed_when: false
-
-    - name: 26.Get Quay database pod name
-      shell: >
-        oc get pod -l quay-component=postgres -n {{ quay_namespace }} -o jsonpath='{.items[0].metadata.name}'
-      register: quay_database_pod_name
-      changed_when: false
-
-    - name: 27.Dump Quay database
-      shell: >
-        oc -n {{ quay_namespace }} exec {{ quay_database_pod_name.stdout }} -- /usr/bin/pg_dump -C {{ quay_database_name.stdout }}  > {{ backup_dir }}/{{ backup_files.quay_database_sql }}
-      changed_when: false
-
-    - name: 28.Get noobaa s3 AWS_ACCESS_KEY_ID
-      ansible.builtin.shell: >
-        oc get secret -l app=noobaa -n {{ quay_namespace }}
-        -o jsonpath='{.items[0].data.AWS_ACCESS_KEY_ID}' | base64 -d
-      register: aws_access_key_id
-      changed_when: false
-      no_log: true
-      when: s3_bucket_odf | bool
-
-    - name: 29.Get noobaa s3 AWS_SECRET_ACCESS_KEY
-      ansible.builtin.shell: >
-        oc get secret -l app=noobaa -n {{ quay_namespace }}
-        -o jsonpath='{.items[0].data.AWS_SECRET_ACCESS_KEY}' | base64 -d
-      register: aws_secret_access_key
-      changed_when: false
-      no_log: true
-      when: s3_bucket_odf | bool
-
-    - name: 30.Copy s3 blobs
-      ansible.builtin.shell: >
-        aws s3 sync --no-verify-ssl
-        --endpoint https://$(oc get route s3 -n openshift-storage -o jsonpath='{.spec.host}')
-        s3://$(oc get cm -l app=noobaa -n {{ quay_namespace }} -o jsonpath='{.items[0].data.BUCKET_NAME}')
-        {{ backup_dir }}/s3_blobs
-      environment:
-        AWS_ACCESS_KEY_ID: "{{ aws_access_key_id.stdout }}"
-        AWS_SECRET_ACCESS_KEY: "{{ aws_secret_access_key.stdout }}"
-      changed_when: false
-      no_log: true
-      when: s3_bucket_odf | bool
-
-    - name: 31.Remove readonly variables from config.yaml
-      ansible.builtin.lineinfile:
-        path: "{{ backup_dir }}/{{ backup_files.quay_bundle_config }}"
-        regexp: '^{{ item.key }}:'
-        state: absent
-      loop: "{{ quay_readonly_config | dict2items }}"
-      tags:
-        - readonly_config
-        - readonly_remove
-
-    - name: 32.Apply quay_bundle_config.yaml
-      ansible.builtin.command:
-        cmd: >
-          oc set data secret/{{ config_bundle_secret_name.stdout }}
-          -n {{ quay_namespace }}
-          --from-file=config.yaml={{ backup_dir }}/{{ backup_files.quay_bundle_config }}
-
-    - name: 33.Wait for the Operator to start a new Quay rollout
-      shell: >
-        oc rollout status deployment/{{ quay_instance }}-quay-app
-        -n {{ quay_namespace }} --timeout=5s
-      register: rollout_normal_start
-      retries: 60
-      delay: 5
-      until: "'successfully rolled out' not in rollout_normal_start.stdout"
-      changed_when: false
-      failed_when: false
-
-    - name: 34.Rollout not started
-      fail:
-        msg: "O Operator não iniciou um novo rollout do deployment {{ quay_instance }}-quay-app, necessario verifificar manualmente."
-      when: "'successfully rolled out' in rollout_normal_start.stdout"
-
-    - name: 35.Wait for Quay to start as **Normal**
-      shell: >
-        oc rollout status deployment/{{ quay_instance }}-quay-app
-        -n {{ quay_namespace }} --timeout=5s
-      register: rollout_normal_status
-      retries: 80
-      delay: 5
-      until: "'successfully rolled out' in rollout_normal_status.stdout"
-      changed_when: false
-      failed_when: false
-
-    - name: 36.Rollout not finished
-      fail:
-        msg: "Rollout do deployment {{ quay_instance }}-quay-app, nao finalizado no tempo esperado, necessario verifificar manualmente."
-      when: "'successfully rolled out' not in rollout_normal_status.stdout"
+    - name: Report completed backup
+      ansible.builtin.debug:
+        msg: "Validated backup completed at {{ backup_final_dir }}"
