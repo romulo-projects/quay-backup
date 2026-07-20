@@ -4,9 +4,10 @@ Ansible workflow for a consistent disaster-recovery backup of Red Hat Quay on
 OpenShift. It is designed for Quay Operator deployments with managed PostgreSQL
 and managed NooBaa/ODF object storage.
 
-**Validated project target:** Red Hat Quay 3.15.5. Always validate the complete
-backup and restore procedure in homologation after upgrading Quay, OpenShift,
-the Quay Operator, Ansible, `oc`, PostgreSQL, or AWS CLI.
+**Target environment:** Red Hat Quay 3.15.2. Operational validation is pending
+in homologation. Revalidate the complete backup and restore procedure after
+upgrading Quay, OpenShift, the Quay Operator, Ansible, `oc`, PostgreSQL, or AWS
+CLI.
 
 ## Safety properties
 
