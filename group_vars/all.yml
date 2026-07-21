@@ -24,7 +24,7 @@ quay_readonly_config:
   INSTANCE_SERVICE_KEY_LOCATION: conf/stack/quay-readonly.pem
 
 # Include managed NooBaa blobs in the disaster-recovery backup.
-backup_managed_noobaa_storage: true
+backup_managed_noobaa_storage: false
 noobaa_route_namespace: openshift-storage
 
 # Keep TLS verification enabled. If the ingress CA is private, set this to the
