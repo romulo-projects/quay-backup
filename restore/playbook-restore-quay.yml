@@ -1,0 +1,788 @@
+---
+- name: Restore Red Hat Quay on OpenShift
+  hosts: localhost
+  gather_facts: false
+  force_handlers: true
+
+  vars:
+    backup_files:
+      database: backup.sql
+      checksums: SHA256SUMS
+      blobs: s3_blobs
+    expected_confirmation: >-
+      {{ ('PREFLIGHT' if (preflight_only | bool)
+      else ('RESUME RESTORE' if (resume_restore | bool) else 'RESTORE'))
+      ~ ' ' ~ quay_namespace ~ '/' ~ quay_instance }}
+    datastore_name: "{{ quay_instance }}-quay-datastore"
+    start_patch_file: "{{ playbook_dir }}/restore-state/{{ quay_instance }}-start-patch.json"
+
+  tasks:
+    - name: Require explicit restore confirmation
+      ansible.builtin.assert:
+        that:
+          - (restore_confirmation | trim) == (expected_confirmation | trim)
+        fail_msg: >-
+          Restore bloqueado. Execute novamente com
+          -e 'restore_confirmation={{ expected_confirmation }}'.
+
+    - name: Reject incompatible execution modes
+      ansible.builtin.assert:
+        that:
+          - not ((preflight_only | bool) and (resume_restore | bool))
+        fail_msg: "preflight_only e resume_restore não podem ser true ao mesmo tempo."
+
+    - name: Validate required local commands
+      ansible.builtin.command: "{{ item }}"
+      loop:
+        - oc version --client
+        - oc whoami
+        - aws --version
+        - sha256sum --version
+      changed_when: false
+
+    - name: Find available backup directories
+      ansible.builtin.find:
+        paths: "{{ backup_root }}"
+        file_type: directory
+        recurse: false
+      register: available_backup_directories
+      when: backup_dir | trim | length == 0
+
+    - name: Require at least one automatic backup candidate
+      ansible.builtin.assert:
+        that:
+          - available_backup_directories.files | length > 0
+        fail_msg: >-
+          Nenhum backup encontrado em {{ backup_root }}. Configure backup_dir
+          ou a variável de ambiente QUAY_BACKUP_ROOT.
+      when: backup_dir | trim | length == 0
+
+    - name: Select requested or most recent backup directory
+      ansible.builtin.set_fact:
+        restore_backup_dir: >-
+          {{ (backup_dir | trim) if (backup_dir | trim | length > 0)
+          else ((available_backup_directories.files | sort(attribute='mtime', reverse=true) | first).path) }}
+
+    - name: Report selected backup without exposing its contents
+      ansible.builtin.debug:
+        msg: "Backup selecionado: {{ restore_backup_dir }}"
+
+    - name: Inspect required backup artifacts
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ restore_backup_dir }}/{{ backup_files.database }}"
+        - "{{ restore_backup_dir }}/{{ backup_files.checksums }}"
+        - "{{ restore_backup_dir }}/config-bundle.yaml"
+        - "{{ restore_backup_dir }}/managed_secret_keys.yaml"
+        - "{{ restore_backup_dir }}/quay-registry.yaml"
+      register: backup_artifacts
+
+    - name: Require backup artifacts with restrictive permissions
+      ansible.builtin.assert:
+        that:
+          - item.stat.exists
+          - item.stat.isreg
+          - item.stat.mode in ['0600', '0400']
+        fail_msg: "Arquivo ausente ou sem modo 0600/0400: {{ item.item }}"
+      loop: "{{ backup_artifacts.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Validate all backup checksums
+      ansible.builtin.command:
+        cmd: sha256sum --check "{{ backup_files.checksums }}"
+        chdir: "{{ restore_backup_dir }}"
+      changed_when: false
+
+    - name: Detect database name from SQL dump
+      ansible.builtin.command:
+        argv:
+          - awk
+          - '/^CREATE DATABASE "/ {name=$3; gsub(/"/, "", name); print name; exit}'
+          - "{{ restore_backup_dir }}/{{ backup_files.database }}"
+      register: detected_database
+      changed_when: false
+
+    - name: Select configured or detected database name
+      ansible.builtin.set_fact:
+        restore_database_name: >-
+          {{ (quay_database_name | trim) if (quay_database_name | trim | length > 0)
+          else (detected_database.stdout | trim) }}
+
+    - name: Validate selected database name
+      ansible.builtin.assert:
+        that:
+          - restore_database_name | length > 0
+          - restore_database_name is match('^[A-Za-z0-9_.-]+$')
+          - detected_database.stdout | trim == restore_database_name
+        fail_msg: >-
+          O nome configurado não corresponde ao CREATE DATABASE do backup,
+          ou nenhum nome seguro foi detectado.
+
+    - name: Validate SQL dump markers and target database
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          grep -Fq 'CREATE DATABASE "{{ restore_database_name }}"' "{{ backup_files.database }}"
+          grep -Fq 'PostgreSQL database dump complete' "{{ backup_files.database }}"
+        chdir: "{{ restore_backup_dir }}"
+        executable: /bin/bash
+      changed_when: false
+
+    - name: Create private workspace for sanitized manifests
+      ansible.builtin.tempfile:
+        state: directory
+        suffix: -quay-restore
+      register: restore_workspace
+      notify: Remove private restore workspace
+
+    - name: Prepare sanitized restore manifests
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python }}"
+          - "{{ playbook_dir }}/scripts/prepare_restore.py"
+          - --backup-dir
+          - "{{ restore_backup_dir }}"
+          - --output-dir
+          - "{{ restore_workspace.path }}"
+          - --instance
+          - "{{ quay_instance }}"
+          - --namespace
+          - "{{ quay_namespace }}"
+      register: prepared_restore
+      changed_when: true
+
+    - name: Record prepared restore metadata
+      ansible.builtin.set_fact:
+        prepared_restore_metadata: "{{ prepared_restore.stdout | from_json }}"
+
+    - name: Create private restore state directory
+      ansible.builtin.file:
+        path: "{{ playbook_dir }}/restore-state"
+        state: directory
+        mode: "0700"
+
+    - name: Preserve non-sensitive component start patch
+      ansible.builtin.copy:
+        src: "{{ restore_workspace.path }}/start-quay-patch.json"
+        dest: "{{ start_patch_file }}"
+        remote_src: true
+        mode: "0600"
+      when:
+        - not (preflight_only | bool)
+
+    - name: Validate sanitized resources against the API server
+      ansible.builtin.command:
+        argv:
+          - oc
+          - apply
+          - --dry-run=server
+          - -f
+          - "{{ restore_workspace.path }}/{{ item }}"
+      loop:
+        - config-bundle.yaml
+        - managed_secret_keys.yaml
+        - quay-registry.yaml
+      changed_when: false
+
+    - name: Check whether target QuayRegistry exists
+      ansible.builtin.command:
+        cmd: >-
+          oc get quayregistry {{ quay_instance }}
+          -n {{ quay_namespace }} -o name
+      register: existing_quay_registry
+      changed_when: false
+      failed_when: false
+
+    - name: Check whether target ObjectBucketClaim exists
+      ansible.builtin.command:
+        cmd: oc get obc {{ datastore_name }} -n {{ quay_namespace }} -o name
+      register: existing_obc
+      changed_when: false
+      failed_when: false
+
+    - name: Check whether expected old ObjectBucket exists
+      ansible.builtin.command:
+        cmd: >-
+          oc get objectbucket obc-{{ quay_namespace }}-{{ datastore_name }} -o name
+      register: existing_object_bucket
+      changed_when: false
+      failed_when: false
+
+    - name: Read residual owned PVC names
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          oc get pvc -n {{ quay_namespace }} -o json |
+          "{{ ansible_playbook_python }}" -c '
+          import json, sys
+          data = json.load(sys.stdin)
+          for item in data.get("items", []):
+              owners = item.get("metadata", {}).get("ownerReferences", [])
+              if any(owner.get("kind") == "QuayRegistry" and
+                     owner.get("name") == "{{ quay_instance }}" for owner in owners):
+                  print(item["metadata"]["name"])
+          '
+        executable: /bin/bash
+      register: residual_pvcs
+      changed_when: false
+      failed_when: false
+
+    - name: Check whether restore Secrets already exist
+      ansible.builtin.command:
+        argv:
+          - oc
+          - get
+          - secret
+          - "{{ item }}"
+          - -n
+          - "{{ quay_namespace }}"
+          - -o
+          - name
+      loop:
+        - "{{ prepared_restore_metadata.config_bundle_secret }}"
+        - "{{ prepared_restore_metadata.managed_keys_secret }}"
+      register: existing_restore_secrets
+      changed_when: false
+      failed_when: false
+
+    - name: Report successful non-destructive preflight
+      ansible.builtin.debug:
+        msg:
+          - "PREFLIGHT CONCLUÍDO; nenhum recurso do cluster foi alterado."
+          - "Alvo confirmado: {{ quay_namespace }}/{{ quay_instance }}"
+          - "Backup selecionado: {{ restore_backup_dir }}"
+          - "Banco detectado: {{ restore_database_name }}"
+          - >-
+            Consumidores que ficarão parados:
+            {{ prepared_restore_metadata.managed_consumers | join(', ') }}
+          - >-
+            QuayRegistry atual:
+            {{ 'presente' if existing_quay_registry.rc == 0 else 'ausente' }}
+          - >-
+            ObjectBucketClaim alvo:
+            {{ 'presente' if existing_obc.rc == 0 else 'ausente' }}
+          - >-
+            ObjectBucket antigo esperado:
+            {{ 'presente' if existing_object_bucket.rc == 0 else 'ausente' }}
+          - >-
+            PVCs pertencentes ao QuayRegistry:
+            {{ residual_pvcs.stdout.split() | join(', ') | default('nenhum', true) }}
+          - >-
+            Destino pronto para restore:
+            {{ 'sim' if (existing_quay_registry.rc != 0 and existing_obc.rc != 0
+            and existing_object_bucket.rc != 0
+            and residual_pvcs.stdout | trim | length == 0
+            and existing_restore_secrets.results | selectattr('rc', 'equalto', 0) | list | length == 0)
+            else 'não; finalize a limpeza manual' }}
+      when: preflight_only | bool
+
+    - name: Remove preflight private workspace
+      ansible.builtin.file:
+        path: "{{ restore_workspace.path }}"
+        state: absent
+      when:
+        - preflight_only | bool
+
+    - name: End play before resource creation and data restore
+      ansible.builtin.meta: end_play
+      when: preflight_only | bool
+
+    - name: Require manually cleaned restore target
+      ansible.builtin.assert:
+        that:
+          - existing_quay_registry.rc != 0
+          - existing_obc.rc != 0
+          - existing_object_bucket.rc != 0
+          - residual_pvcs.stdout | trim | length == 0
+          - existing_restore_secrets.results | selectattr('rc', 'equalto', 0) | list | length == 0
+        fail_msg: >-
+          O destino ainda contém recursos do Quay. O playbook não excluirá nada;
+          finalize a limpeza manual e execute novamente.
+      when: not (resume_restore | bool)
+
+    - name: Require safely provisioned target for resume
+      ansible.builtin.assert:
+        that:
+          - existing_quay_registry.rc == 0
+          - existing_obc.rc == 0
+          - existing_restore_secrets.results | selectattr('rc', 'equalto', 0) | list | length == 2
+        fail_msg: >-
+          A retomada exige o QuayRegistry, OBC e os dois Secrets criados pela
+          execução interrompida. Nenhum recurso foi alterado.
+      when: resume_restore | bool
+
+    - name: Create sanitized configuration and managed keys
+      ansible.builtin.command:
+        argv:
+          - oc
+          - create
+          - -f
+          - "{{ restore_workspace.path }}/{{ item }}"
+      loop:
+        - config-bundle.yaml
+        - managed_secret_keys.yaml
+      changed_when: true
+      no_log: true
+      when: not (resume_restore | bool)
+
+    - name: Create QuayRegistry with all managed consumers stopped
+      ansible.builtin.command:
+        argv:
+          - oc
+          - create
+          - -f
+          - "{{ restore_workspace.path }}/quay-registry.yaml"
+      changed_when: true
+      when: not (resume_restore | bool)
+
+    - name: Wait for managed PostgreSQL pod
+      ansible.builtin.command:
+        cmd: >-
+          oc wait pod -n {{ quay_namespace }} -l quay-component=postgres
+          --for=condition=Ready --timeout=30s
+      register: postgres_ready
+      changed_when: false
+      retries: 20
+      delay: 15
+      until: postgres_ready.rc == 0
+
+    - name: Wait for managed Clair PostgreSQL pod
+      ansible.builtin.command:
+        cmd: >-
+          oc wait pod -n {{ quay_namespace }} -l quay-component=clair-postgres
+          --for=condition=Ready --timeout=30s
+      register: clair_postgres_ready
+      changed_when: false
+      retries: 20
+      delay: 15
+      until: clair_postgres_ready.rc == 0
+      when: prepared_restore_metadata.clairpostgres_managed | bool
+
+    - name: Wait for new ObjectBucketClaim to bind
+      ansible.builtin.command:
+        cmd: >-
+          oc get obc {{ datastore_name }} -n {{ quay_namespace }}
+          -o jsonpath={.status.phase}
+      register: new_obc_phase
+      changed_when: false
+      retries: 60
+      delay: 10
+      until: new_obc_phase.stdout | trim == 'Bound'
+
+    - name: Read target QuayRegistry
+      ansible.builtin.command:
+        cmd: >-
+          oc get quayregistry {{ quay_instance }}
+          -n {{ quay_namespace }} -o json
+      register: quay_registry
+      changed_when: false
+
+    - name: Record QuayRegistry state
+      ansible.builtin.set_fact:
+        quay_registry_object: "{{ quay_registry.stdout | from_json }}"
+
+    - name: Require expected target QuayRegistry
+      ansible.builtin.assert:
+        that:
+          - quay_registry_object.metadata.name == quay_instance
+          - quay_registry_object.metadata.namespace == quay_namespace
+        fail_msg: "O QuayRegistry recriado não corresponde ao alvo confirmado."
+
+    - name: Count running data consumer pods
+      ansible.builtin.command:
+        cmd: >-
+          oc get pods -n {{ quay_namespace }} -l quay-component={{ item }}
+          -o jsonpath={.items[*].metadata.name}
+      loop:
+        - quay
+        - clair
+        - mirror
+      register: data_consumer_pods
+      changed_when: false
+
+    - name: Require all data consumers to be stopped
+      ansible.builtin.assert:
+        that:
+          - item.stdout | trim | length == 0
+        fail_msg: >-
+          Há pods {{ item.item }} acessando banco ou storage. O restore foi bloqueado.
+      loop: "{{ data_consumer_pods.results }}"
+      loop_control:
+        label: "{{ item.item }}"
+
+    - name: Get PostgreSQL pod
+      ansible.builtin.command:
+        cmd: >-
+          oc get pod -n {{ quay_namespace }} -l quay-component=postgres
+          -o jsonpath={.items[0].metadata.name}
+      register: database_pod
+      changed_when: false
+
+    - name: Require PostgreSQL pod
+      ansible.builtin.assert:
+        that:
+          - database_pod.stdout | trim | length > 0
+        fail_msg: "Pod PostgreSQL gerenciado não encontrado."
+
+    - name: Validate PostgreSQL connectivity
+      ansible.builtin.command:
+        cmd: >-
+          oc exec -n {{ quay_namespace }} {{ database_pod.stdout }} --
+          psql -d postgres -v ON_ERROR_STOP=1 -Atc 'SELECT 1;'
+      changed_when: false
+
+    - name: Inspect local S3 blob directory
+      ansible.builtin.stat:
+        path: "{{ restore_backup_dir }}/{{ backup_files.blobs }}"
+      register: blob_directory
+      when: restore_s3 | bool
+
+    - name: Require S3 backup
+      ansible.builtin.assert:
+        that:
+          - blob_directory.stat.exists
+          - blob_directory.stat.isdir
+        fail_msg: "Diretório s3_blobs ausente no backup selecionado."
+      when: restore_s3 | bool
+
+    - name: Create temporary CA file when none was provided
+      ansible.builtin.tempfile:
+        state: file
+        suffix: -quay-ingress-ca.pem
+      register: temporary_ca_file
+      notify: Remove temporary CA file
+      when:
+        - restore_s3 | bool
+        - aws_ca_bundle | trim | length == 0
+
+    - name: Read ingress CA from OpenShift
+      ansible.builtin.command:
+        argv:
+          - oc
+          - get
+          - configmap
+          - "{{ ingress_ca_configmap }}"
+          - -n
+          - "{{ ingress_ca_namespace }}"
+          - -o
+          - 'jsonpath={.data.ca-bundle\.crt}'
+      register: ingress_ca_content
+      changed_when: false
+      when:
+        - restore_s3 | bool
+        - aws_ca_bundle | trim | length == 0
+
+    - name: Save ingress CA with restrictive permissions
+      ansible.builtin.copy:
+        content: "{{ ingress_ca_content.stdout }}"
+        dest: "{{ temporary_ca_file.path }}"
+        mode: "0600"
+      no_log: true
+      when:
+        - restore_s3 | bool
+        - aws_ca_bundle | trim | length == 0
+
+    - name: Select provided or temporary CA bundle
+      ansible.builtin.set_fact:
+        restore_ca_bundle: >-
+          {{ (aws_ca_bundle | trim) if (aws_ca_bundle | trim | length > 0)
+          else temporary_ca_file.path }}
+      when: restore_s3 | bool
+
+    - name: Inspect S3 CA bundle
+      ansible.builtin.stat:
+        path: "{{ restore_ca_bundle }}"
+      register: ca_bundle
+      when: restore_s3 | bool
+
+    - name: Require non-empty S3 CA bundle
+      ansible.builtin.assert:
+        that:
+          - ca_bundle.stat.exists
+          - ca_bundle.stat.isreg
+          - ca_bundle.stat.size | int > 0
+        fail_msg: "CA S3 ausente ou vazia: {{ restore_ca_bundle }}"
+      when: restore_s3 | bool
+
+    - name: Read target bucket name
+      ansible.builtin.command:
+        cmd: >-
+          oc get configmap {{ datastore_name }} -n {{ quay_namespace }}
+          -o jsonpath={.data.BUCKET_NAME}
+      register: target_bucket
+      changed_when: false
+      when: restore_s3 | bool
+
+    - name: Require target bucket name
+      ansible.builtin.assert:
+        that:
+          - target_bucket.stdout | trim | length > 0
+        fail_msg: "O Operator não informou o bucket do novo ObjectBucketClaim."
+      when: restore_s3 | bool
+
+    - name: Read target S3 endpoint
+      ansible.builtin.command:
+        cmd: >-
+          oc get route {{ s3_route }} -n {{ s3_namespace }}
+          -o jsonpath=https://{.spec.host}
+      register: s3_endpoint
+      changed_when: false
+      when: restore_s3 | bool
+
+    - name: Read target bucket access key
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          oc get secret {{ datastore_name }} -n {{ quay_namespace }} \
+          -o jsonpath='{.data.AWS_ACCESS_KEY_ID}' | base64 -d
+        executable: /bin/bash
+      register: s3_access_key
+      changed_when: false
+      no_log: true
+      when: restore_s3 | bool
+
+    - name: Read target bucket secret key
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          oc get secret {{ datastore_name }} -n {{ quay_namespace }} \
+          -o jsonpath='{.data.AWS_SECRET_ACCESS_KEY}' | base64 -d
+        executable: /bin/bash
+      register: s3_secret_key
+      changed_when: false
+      no_log: true
+      when: restore_s3 | bool
+
+    - name: Summarize target bucket before restore
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          aws s3 ls "s3://{{ target_bucket.stdout }}" \
+          --endpoint-url "{{ s3_endpoint.stdout }}" --recursive --summarize |
+          awk '
+          /Total Objects:/ { objects=$3 }
+          /Total Size:/ { size=$3 }
+          END {
+              if (objects == "" || size == "") exit 1
+              print objects "|" size
+          }'
+        executable: /bin/bash
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ s3_access_key.stdout }}"
+        AWS_SECRET_ACCESS_KEY: "{{ s3_secret_key.stdout }}"
+        AWS_CA_BUNDLE: "{{ restore_ca_bundle }}"
+      register: target_summary_before
+      changed_when: false
+      no_log: true
+      when: restore_s3 | bool
+
+    - name: Require empty target bucket
+      ansible.builtin.assert:
+        that:
+          - (target_summary_before.stdout | trim).split('|')[0] | int == 0
+          - (target_summary_before.stdout | trim).split('|')[1] | int == 0
+        fail_msg: "O bucket de destino não está vazio. Restore bloqueado para evitar sobrescrita."
+      when: restore_s3 | bool
+
+    - name: Terminate connections to fresh target database
+      ansible.builtin.command:
+        argv:
+          - oc
+          - exec
+          - -n
+          - "{{ quay_namespace }}"
+          - "{{ database_pod.stdout }}"
+          - --
+          - psql
+          - -d
+          - postgres
+          - -v
+          - ON_ERROR_STOP=1
+          - -c
+          - >-
+            SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+            WHERE datname = '{{ restore_database_name }}'
+            AND pid <> pg_backend_pid();
+      changed_when: true
+
+    - name: Drop fresh target database
+      ansible.builtin.command:
+        argv:
+          - oc
+          - exec
+          - -n
+          - "{{ quay_namespace }}"
+          - "{{ database_pod.stdout }}"
+          - --
+          - psql
+          - -d
+          - postgres
+          - -v
+          - ON_ERROR_STOP=1
+          - -c
+          - 'DROP DATABASE IF EXISTS "{{ restore_database_name }}";'
+      changed_when: true
+
+    - name: Restore PostgreSQL dump
+      ansible.builtin.shell:
+        cmd: >-
+          oc exec -i -n {{ quay_namespace }} {{ database_pod.stdout }} --
+          psql -d postgres -v ON_ERROR_STOP=1 < {{ backup_files.database }}
+        chdir: "{{ restore_backup_dir }}"
+        executable: /bin/bash
+      changed_when: true
+
+    - name: Validate restored database
+      ansible.builtin.command:
+        argv:
+          - oc
+          - exec
+          - -n
+          - "{{ quay_namespace }}"
+          - "{{ database_pod.stdout }}"
+          - --
+          - psql
+          - -d
+          - "{{ restore_database_name }}"
+          - -v
+          - ON_ERROR_STOP=1
+          - -Atc
+          - >-
+            SELECT count(*) FROM information_schema.tables
+            WHERE table_schema = 'public';
+      register: restored_table_count
+      changed_when: false
+
+    - name: Require restored Quay schema
+      ansible.builtin.assert:
+        that:
+          - restored_table_count.stdout | trim | int > 0
+        fail_msg: "O banco restaurado não contém tabelas públicas."
+
+    - name: Restore S3 blobs to empty target bucket
+      ansible.builtin.command:
+        argv:
+          - aws
+          - s3
+          - sync
+          - "{{ restore_backup_dir }}/{{ backup_files.blobs }}/"
+          - "s3://{{ target_bucket.stdout }}"
+          - --endpoint-url
+          - "{{ s3_endpoint.stdout }}"
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ s3_access_key.stdout }}"
+        AWS_SECRET_ACCESS_KEY: "{{ s3_secret_key.stdout }}"
+        AWS_CA_BUNDLE: "{{ restore_ca_bundle }}"
+      changed_when: true
+      no_log: true
+      when: restore_s3 | bool
+
+    - name: Summarize local backup blobs
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          find "{{ backup_files.blobs }}" -type f -printf '%s\n' |
+          awk '{ count++; size += $1 } END { print count "|" size + 0 }'
+        chdir: "{{ restore_backup_dir }}"
+        executable: /bin/bash
+      register: local_blob_summary
+      changed_when: false
+      when: restore_s3 | bool
+
+    - name: Summarize target bucket after restore
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          aws s3 ls "s3://{{ target_bucket.stdout }}" \
+          --endpoint-url "{{ s3_endpoint.stdout }}" --recursive --summarize |
+          awk '
+          /Total Objects:/ { objects=$3 }
+          /Total Size:/ { size=$3 }
+          END {
+              if (objects == "" || size == "") exit 1
+              print objects "|" size
+          }'
+        executable: /bin/bash
+      environment:
+        AWS_ACCESS_KEY_ID: "{{ s3_access_key.stdout }}"
+        AWS_SECRET_ACCESS_KEY: "{{ s3_secret_key.stdout }}"
+        AWS_CA_BUNDLE: "{{ restore_ca_bundle }}"
+      register: target_summary_after
+      changed_when: false
+      no_log: true
+      when: restore_s3 | bool
+
+    - name: Validate restored S3 object count and size
+      ansible.builtin.assert:
+        that:
+          - >-
+            (target_summary_after.stdout | trim).split('|')[0] | int ==
+            (local_blob_summary.stdout | trim).split('|')[0] | int
+          - >-
+            (target_summary_after.stdout | trim).split('|')[1] | int ==
+            (local_blob_summary.stdout | trim).split('|')[1] | int
+        fail_msg: >-
+          A quantidade ou o tamanho total dos objetos restaurados no S3 não
+          corresponde ao backup local.
+      when: restore_s3 | bool
+
+    - name: Restore original component scaling after restore
+      ansible.builtin.command:
+        argv:
+          - oc
+          - patch
+          - quayregistry
+          - "{{ quay_instance }}"
+          - -n
+          - "{{ quay_namespace }}"
+          - --type=json
+          - --patch-file
+          - "{{ start_patch_file }}"
+      changed_when: true
+      when: start_quay_after_restore | bool
+
+    - name: Wait for Quay rollout
+      ansible.builtin.command:
+        cmd: >-
+          oc rollout status deployment/{{ quay_instance }}-quay-app
+          -n {{ quay_namespace }} --timeout=10m
+      changed_when: false
+      when: start_quay_after_restore | bool
+
+    - name: Wait for QuayRegistry availability
+      ansible.builtin.command:
+        cmd: >-
+          oc wait quayregistry/{{ quay_instance }} -n {{ quay_namespace }}
+          --for=condition=Available=true --timeout=15m
+      changed_when: false
+      when: start_quay_after_restore | bool
+
+    - name: Report successful restore
+      ansible.builtin.debug:
+        msg:
+          - >-
+            Banco {{ restore_database_name }} restaurado com
+            {{ restored_table_count.stdout | trim }} tabelas públicas.
+          - >-
+            S3 restaurado:
+            {{ ((target_summary_after.stdout | trim).split('|')[0] ~ ' objeto(s), ' ~
+            (target_summary_after.stdout | trim).split('|')[1] ~ ' byte(s)')
+            if (restore_s3 | bool) else 'desabilitado' }}.
+          - >-
+            Quay {{ 'iniciado' if (start_quay_after_restore | bool)
+            else 'mantido parado para validação manual' }}.
+
+  handlers:
+    - name: Remove private restore workspace
+      ansible.builtin.file:
+        path: "{{ restore_workspace.path }}"
+        state: absent
+      when: restore_workspace.path is defined
+
+    - name: Remove temporary CA file
+      ansible.builtin.file:
+        path: "{{ temporary_ca_file.path }}"
+        state: absent
+      when: temporary_ca_file.path is defined

@@ -1,0 +1,44 @@
+---
+# QuayRegistry de destino especificar os nomes da instância e namespace.
+quay_instance: quay-example
+quay_namespace: quay-example
+
+# Diretório raiz gerado pelo projeto quay-backup.
+backup_root: >-
+  {{ lookup('env', 'QUAY_BACKUP_ROOT') |
+  default((playbook_dir | dirname) ~ '/backups', true) }}
+
+# Opcional. Vazio seleciona automaticamente o backup mais recente em backup_root.
+backup_dir: ""
+
+# Opcional. Vazio extrai o nome do CREATE DATABASE presente em backup.sql.
+quay_database_name: ""
+
+# Restore opcional do bucket ODF/NooBaa.
+restore_s3: true
+s3_namespace: openshift-storage
+s3_route: s3
+
+# Opcional. Vazio extrai a CA do ConfigMap de ingress para um arquivo temporário.
+aws_ca_bundle: ""
+ingress_ca_namespace: openshift-config-managed
+ingress_ca_configmap: default-ingress-cert
+
+# Mantém o Quay parado por padrão para inspeção após o restore.
+start_quay_after_restore: true
+
+# true executa validações e dry-run, mas encerra antes de criar ou restaurar.
+preflight_only: false
+
+# true retoma após falha ocorrida depois da criação dos recursos novos.
+resume_restore: false
+
+# Proteção obrigatória. Mantenha vazio neste arquivo e informe ao executar:
+# ansible-playbook playbook-restore-quay.yml \
+# Restore a partir do backup após a limpeza manual do ambiente:
+#   -e 'restore_confirmation=RESTORE <namespace>/<quay_instance>'
+# Validação segura com preflight_only=true:
+#   -e 'restore_confirmation=PREFLIGHT <namespace>/<quay_instance>'
+# Retomada segura com resume_restore=true:
+#   -e 'restore_confirmation=RESUME RESTORE <namespace>/<quay_instance>'
+restore_confirmation: ""
