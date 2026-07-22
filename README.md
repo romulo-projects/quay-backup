@@ -2,6 +2,11 @@
 
 Ansible playbook to back up a Red Hat Quay instance running on OpenShift. It exports QuayRegistry and secrets, switches Quay to read-only, dumps the PostgreSQL database, optionally syncs object storage blobs from NooBaa/ODF S3, then restores normal operation.
 
+The repository also includes an optional restore workflow under `restore/`. It
+recreates a manually cleaned QuayRegistry, restores PostgreSQL and optionally
+restores NooBaa/ODF S3 blobs. See the complete
+[restore runbook](restore/README.md) before performing a recovery.
+
 **Validated against:** Red Hat Quay **3.15.5**
 
 ## Prerequisites
@@ -59,6 +64,57 @@ ansible-playbook playbook-backup-quay.yml
 
 Backups are written under `backups/<timestamp>/`.
 
+5. Create the checksum manifest required by the restore workflow:
+
+```bash
+BACKUP_DIR="$(
+  find backups -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' |
+  sort -nr |
+  head -n1 |
+  cut -d' ' -f2-
+)"
+
+(
+  cd "$BACKUP_DIR"
+  find . -type f -not -name SHA256SUMS -exec sha256sum '{}' \; |
+    sort > SHA256SUMS
+  chmod 600 SHA256SUMS
+  sha256sum --check SHA256SUMS
+)
+```
+
+Every checksum must report `OK`. Keep the backup directory at mode `0700` and
+its sensitive files at mode `0600`. Backup contents, database dumps, secrets,
+private keys and S3 blobs must never be committed.
+
+## Restore
+
+The restore workflow is intentionally separate from the backup execution:
+
+- run it from the `restore/` directory so Ansible loads the restore-specific
+  configuration, inventory and variables;
+- run the non-destructive preflight first;
+- select the intended backup directory explicitly when more than one backup
+  exists;
+- manually remove the old QuayRegistry and wait for its managed resources to
+  disappear;
+- never remove finalizers forcibly;
+- start the restore only when the preflight reports
+  `Destino pronto para restore: sim`.
+
+The cleanup step is destructive and is never performed by the restore
+playbook. The local `backups/` directory is not deleted or modified by the
+OpenShift resource cleanup.
+
+Start by reading the complete procedure:
+
+```bash
+cd restore
+```
+
+Then follow [restore/README.md](restore/README.md), including backup integrity,
+preflight, manual cleanup, restore, resume and final validation steps.
+
 ## Variables
 
 Defined in `group_vars/all.yml`:
@@ -100,10 +156,18 @@ When `s3_bucket_odf` is enabled, object storage content is also synced to `s3_bl
 ```
 .
 ├── ansible.cfg
+├── backups/                 # backup output (gitignored contents)
 ├── group_vars/all.yml
 ├── inventory/hosts.yml
 ├── playbook-backup-quay.yml
-└── backups/                 # backup output (gitignored contents)
+└── restore/
+    ├── README.md
+    ├── ansible.cfg
+    ├── group_vars/all.yml
+    ├── inventory/hosts.yml
+    ├── playbook-restore-quay.yml
+    ├── requirements.txt
+    └── scripts/prepare_restore.py
 ```
 
 ## References

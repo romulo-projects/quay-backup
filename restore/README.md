@@ -162,6 +162,26 @@ ansible-playbook --syntax-check playbook-restore-quay.yml
 
 ## Execução
 
+Execute todos os comandos desta seção a partir do diretório `restore/`. Isso
+garante que o Ansible carregue `restore/ansible.cfg`, o inventário e as
+variáveis específicas do restore:
+
+```bash
+cd restore
+```
+
+Selecione explicitamente o backup que será restaurado, especialmente quando
+existir mais de um diretório em `../backups`:
+
+```bash
+export RESTORE_BACKUP_DIR="$(realpath ../backups/<AAAAMMDDTHHMMSS>)"
+test -d "$RESTORE_BACKUP_DIR" && printf 'Backup selecionado: %s\n' "$RESTORE_BACKUP_DIR"
+```
+
+Os exemplos seguintes utilizam `RESTORE_BACKUP_DIR`. Se `backup_dir` não for
+informado, o playbook continuará selecionando automaticamente o diretório mais
+recente dentro de `backup_root`.
+
 ### Preflight sem alterações no cluster
 
 Execute primeiro o preflight. Ele valida arquivos, checksums, nomes, manifests,
@@ -170,6 +190,7 @@ alvo e os recursos encontrados e encerra antes de qualquer criação ou restore:
 
 ```bash
 ansible-playbook playbook-restore-quay.yml \
+  -e backup_dir="$RESTORE_BACKUP_DIR" \
   -e '{
     "quay_instance": "quay-example",
     "quay_namespace": "quay-example",
@@ -258,6 +279,7 @@ Para restaurar, validar e iniciar o Quay automaticamente:
 
 ```bash
 ansible-playbook playbook-restore-quay.yml \
+  -e backup_dir="$RESTORE_BACKUP_DIR" \
   -e '{
     "quay_instance": "quay-example",
     "quay_namespace": "quay-example",
@@ -273,6 +295,7 @@ a confirmação:
 
 ```bash
 ansible-playbook playbook-restore-quay.yml \
+  -e backup_dir="$RESTORE_BACKUP_DIR" \
   -e '{"restore_confirmation":"RESTORE quay-example/quay-example"}'
 ```
 
@@ -298,6 +321,7 @@ repita o modo normal. Corrija a causa e retome com confirmação específica:
 
 ```bash
 ansible-playbook playbook-restore-quay.yml \
+  -e backup_dir="$RESTORE_BACKUP_DIR" \
   -e '{
     "quay_instance": "quay-example",
     "quay_namespace": "quay-example",
