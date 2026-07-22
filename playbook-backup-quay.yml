@@ -192,8 +192,13 @@
 
     - name: 27.Dump Quay database
       shell: >
-        oc -n {{ quay_namespace }} exec {{ quay_database_pod_name.stdout }} -- /usr/bin/pg_dump -C {{ quay_database_name.stdout }}  > {{ backup_dir }}/{{ backup_files.quay_database_sql }}
+        umask 077 && oc -n {{ quay_namespace }} exec {{ quay_database_pod_name.stdout }} -- /usr/bin/pg_dump -C {{ quay_database_name.stdout }}  > {{ backup_dir }}/{{ backup_files.quay_database_sql }}
       changed_when: false
+
+    - name: 27.1.Protect Quay database dump
+      ansible.builtin.file:
+        path: "{{ backup_dir }}/{{ backup_files.quay_database_sql }}"
+        mode: "0600"
 
     - name: 28.Get noobaa s3 AWS_ACCESS_KEY_ID
       ansible.builtin.shell: >
@@ -215,7 +220,7 @@
 
     - name: 30.Copy s3 blobs
       ansible.builtin.shell: >
-        aws s3 sync --no-verify-ssl
+        umask 077 && aws s3 sync --no-verify-ssl
         --endpoint https://$(oc get route s3 -n openshift-storage -o jsonpath='{.spec.host}')
         s3://$(oc get cm -l app=noobaa -n {{ quay_namespace }} -o jsonpath='{.items[0].data.BUCKET_NAME}')
         {{ backup_dir }}/s3_blobs
@@ -274,3 +279,25 @@
       fail:
         msg: "Rollout do deployment {{ quay_instance }}-quay-app, nao finalizado no tempo esperado, necessario verifificar manualmente."
       when: "'successfully rolled out' not in rollout_normal_status.stdout"
+
+    - name: 37.Generate backup checksums
+      ansible.builtin.shell:
+        cmd: |
+          set -o pipefail
+          umask 077
+          find . -type f -not -name SHA256SUMS -exec sha256sum '{}' \; |
+            LC_ALL=C sort > SHA256SUMS
+        chdir: "{{ backup_dir }}"
+        executable: /bin/bash
+      changed_when: true
+
+    - name: 38.Protect checksum manifest
+      ansible.builtin.file:
+        path: "{{ backup_dir }}/SHA256SUMS"
+        mode: "0600"
+
+    - name: 39.Validate backup checksums
+      ansible.builtin.command:
+        cmd: sha256sum --check SHA256SUMS
+        chdir: "{{ backup_dir }}"
+      changed_when: false

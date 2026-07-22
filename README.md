@@ -64,7 +64,7 @@ ansible-playbook playbook-backup-quay.yml
 
 Backups are written under `backups/<timestamp>/`.
 
-5. Create the checksum manifest required by the restore workflow:
+5. Confirm the checksum manifest generated automatically by the backup:
 
 ```bash
 BACKUP_DIR="$(
@@ -74,17 +74,14 @@ BACKUP_DIR="$(
   cut -d' ' -f2-
 )"
 
-(
-  cd "$BACKUP_DIR"
-  find . -type f -not -name SHA256SUMS -exec sha256sum '{}' \; |
-    sort > SHA256SUMS
-  chmod 600 SHA256SUMS
-  sha256sum --check SHA256SUMS
-)
+test -s "$BACKUP_DIR/SHA256SUMS"
+stat -c '%a %n' "$BACKUP_DIR/backup.sql" "$BACKUP_DIR/SHA256SUMS"
+(cd "$BACKUP_DIR" && sha256sum --check SHA256SUMS)
 ```
 
-Every checksum must report `OK`. Keep the backup directory at mode `0700` and
-its sensitive files at mode `0600`. Backup contents, database dumps, secrets,
+The playbook creates `backup.sql` and `SHA256SUMS` with mode `0600` and validates
+all checksums before completing. Every checksum must report `OK`. Keep the
+backup directory at mode `0700`; backup contents, database dumps, secrets,
 private keys and S3 blobs must never be committed.
 
 ## Restore
