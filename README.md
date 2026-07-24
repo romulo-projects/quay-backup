@@ -79,10 +79,13 @@ stat -c '%a %n' "$BACKUP_DIR/backup.sql" "$BACKUP_DIR/SHA256SUMS"
 (cd "$BACKUP_DIR" && sha256sum --check SHA256SUMS)
 ```
 
-The playbook creates `backup.sql` and `SHA256SUMS` with mode `0600` and validates
-all checksums before completing. Every checksum must report `OK`. Keep the
-backup directory at mode `0700`; backup contents, database dumps, secrets,
-private keys and S3 blobs must never be committed.
+The playbook extracts the database name from the saved `quay_config.yaml`,
+blocks the dump if no safe name is detected, and confirms that `backup.sql`
+contains that exact database and the PostgreSQL completion marker. It creates
+`backup.sql` and `SHA256SUMS` with mode `0600` and validates all checksums before
+completing. Every checksum must report `OK`. Keep the backup directory at mode
+`0700`; backup contents, database dumps, secrets, private keys and S3 blobs must
+never be committed.
 
 ## Restore
 
